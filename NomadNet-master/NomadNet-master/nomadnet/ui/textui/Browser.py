@@ -1,0 +1,2430 @@
+import RNS
+import LXMF
+import io
+import os
+import time
+import bisect
+import urwid
+import shutil
+import nomadnet
+import subprocess
+import threading
+from threading import Lock
+from .MicronParser import markup_to_attrmaps, make_style, default_state
+from nomadnet.Directory import DirectoryEntry
+from nomadnet.Conversation import ConversationMessage
+from nomadnet.vendor.Scrollable import *
+from nomadnet.util import strip_modifiers
+from nomadnet.util import sanitize_name
+from nomadnet.ui.textui.images import _termlib
+from .Helpers import ClickableIcon, osc52_copy
+from .ReadlineEdit import ReadlineMixin, ReadlineEdit
+
+IMGLOAD_NEVER  = 0x00
+IMGLOAD_MANUAL = 0x01
+IMGLOAD_AUTO   = 0x02
+IMGLOAD_ALWAYS = 0x03
+
+class BrowserFrame(urwid.Frame):
+    def keypress(self, size, key):
+        if key == "ctrl w":
+            self.delegate.disconnect()
+        elif key == "ctrl d":
+            self.delegate.back()
+        elif key == "ctrl f":
+            self.delegate.forward()
+        elif key == "ctrl r":
+            self.delegate.reload()
+        elif key == "ctrl u":
+            self.delegate.url_dialog()
+        elif key == "ctrl l":
+            self.delegate.load_images()
+        elif key == "ctrl x":
+            self.delegate.load_images(force_reload=True)
+        elif key == "ctrl s":
+            self.delegate.save_node_dialog()
+        elif key == "ctrl b":
+            self.delegate.save_node_dialog()
+        elif key == "ctrl g":
+            nomadnet.NomadNetworkApp.get_shared_instance().ui.main_display.sub_displays.network_display.toggle_fullscreen()
+        elif key == "ctrl y":
+            if self.delegate.app.config["textui"]["clipboard_copy"]:
+                self.delegate.copy_url()
+        elif self.focus_position == "body":
+            if key == "down" or key == "up":
+                try:
+                    if hasattr(self.delegate, "page_list") and self.delegate.page_list:
+                        def df(loop, user_data):
+                            st = None
+                            if self.delegate.page_list:
+                                nf = self.delegate.page_list.focus
+                                if hasattr(nf, "key_timeout"):
+                                    st = nf
+                                elif hasattr(nf, "original_widget"):
+                                    no = nf.original_widget
+                                    if hasattr(no, "original_widget"):
+                                        st = no.original_widget
+                                    else:
+                                        if hasattr(no, "key_timeout"):
+                                            st = no
+                            
+                                if st and hasattr(st, "key_timeout") and hasattr(st, "keypress") and callable(st.keypress):
+                                    st.keypress(None, None)
+
+                        nomadnet.NomadNetworkApp.get_shared_instance().ui.loop.set_alarm_in(0.25, df)
+                
+                except Exception as e:
+                    RNS.log("Error while setting up cursor timeout. The contained exception was: "+str(e), RNS.LOG_ERROR)
+                                        
+            return super(BrowserFrame, self).keypress(size, key)
+
+        else:
+            return super(BrowserFrame, self).keypress(size, key)
+
+class PageList(urwid.ListBox):
+    def __init__(self, body):
+        super().__init__(body)
+        self._page_size = (0, 0)
+        self._page_focus = None
+        self._page_layouts = {}
+
+    def invalidate_layout(self):
+        self._page_layouts = {}
+        self._invalidate()
+
+    def _layout(self, maxcol):
+        offsets = self._page_layouts.get(maxcol)
+        if offsets is None or len(offsets) != len(self.body) + 1:
+            layout_started = time.time()
+            offsets = [0]
+            for widget in self.body:
+                offsets.append(offsets[-1] + widget.rows((maxcol,), True))
+            self._page_layouts[maxcol] = offsets
+            # RNS.log(f" rebuilt {len(self.body)} widgets, {offsets[-1]} rows, width {maxcol}, {(time.time()-layout_started)*1000:.1f}ms", RNS.LOG_DEBUG)
+        return offsets
+
+    def calculate_visible(self, size, focus=False):
+        visible = super().calculate_visible(size, focus)
+        if visible is not None and self.body:
+            self._sync_layout(size[0], visible)
+        return visible
+
+    def _sync_layout(self, maxcol, visible):
+        # Validate the cached layout against the live geometry of the
+        # currently visible widgets, and delta-update the cached offsets when a
+        # visible widget has changed height since the layout was built without
+        # rescanning the entire document on every render.
+
+        if not self.body or not self._page_layouts: return
+
+        offsets = self._page_layouts.get(maxcol)
+        if offsets is None or len(offsets) != len(self.body) + 1: return
+
+        def sync_position(pos, live_rows):
+            if pos < 0 or pos >= len(self.body) or live_rows < 0: return
+            cached_rows = offsets[pos + 1] - offsets[pos]
+            if cached_rows == live_rows: return
+
+            delta = live_rows - cached_rows
+            for i in range(pos + 1, len(offsets)): offsets[i] += delta
+
+            # Other cached widths may also be affected by this change. Sync
+            # them using the changed widget's live rows at their widths.
+            for width, other in list(self._page_layouts.items()):
+                if width == maxcol or len(other) != len(offsets): continue
+                other_cached = other[pos + 1] - other[pos]
+                other_live = self.body[pos].rows((width,), True)
+                if other_cached == other_live: continue
+                other_delta = other_live - other_cached
+                for i in range(pos + 1, len(other)): other[i] += other_delta
+
+        middle = visible.middle
+        sync_position(middle.focus_pos, middle.focus_rows)
+        for item in visible.top.fill:    sync_position(item.position, item.rows)
+        for item in visible.bottom.fill: sync_position(item.position, item.rows)
+
+    def render(self, size, focus=False):
+        self._page_size = size
+        if self.body and self.focus is not self._page_focus:
+            self._page_focus = self.focus
+            widget = self.focus
+            while widget is not None:
+                widget._invalidate()
+                widget = getattr(widget, "original_widget", None)
+        return super().render(size, focus)
+
+    def rows_max(self, size=None, focus=False):
+        size = size or self._page_size
+        return self._layout(size[0])[-1]
+
+    def get_scrollpos(self, size=None, focus=False):
+        size = size or self._page_size
+        if not self.body or not size[1]: return 0
+
+        middle, top, bottom = self.calculate_visible(size, focus)
+        if middle is None: return 0
+        return self._layout(size[0])[self.top_position(size)] + top.trim
+
+    def set_scrollpos(self, position):
+        size = self._page_size
+        maxcol,  maxrow = size
+        if not self.body or not maxrow: return
+
+        offsets = self._layout(maxcol)
+        position = max(0, min(int(position), max(0, offsets[-1] - maxrow)))
+        pos = bisect.bisect_left(offsets, position, 0, len(self.body))
+        if pos == len(self.body) or offsets[pos] - position >= maxrow: pos -= 1
+
+        # Guard against the cached layout being inconsistent
+        # with the live widget geometry. Without it, change_focus
+        # can be called with an offset that the live target widget
+        # cannot satisfy, raising ListBoxError.
+        pos = max(0, min(pos, len(self.body) - 1))
+        offset_inset = offsets[pos] - position
+        if offset_inset > maxrow - 1: offset_inset = maxrow - 1
+        elif offset_inset < 0:
+            tgt_rows = max(1, self.body[pos].rows((maxcol,), True))
+            if offset_inset < 1 - tgt_rows: offset_inset = 1 - tgt_rows
+
+        self.change_focus(size, pos, offset_inset)
+
+    def top_position(self, size=None):
+        size = size or self._page_size
+        if not self.body or not size[1]: return 0
+        middle, top, bottom = self.calculate_visible(size, True)
+        if middle is None: return 0
+        return top.fill[-1].position if top.fill else middle.focus_pos
+
+    def scroll(self, rows):
+        self.set_scrollpos(self.get_scrollpos() + rows)
+
+    def focused_widget_name(self):
+        widget = self.focus
+        while getattr(widget, "original_widget", None) is not None: widget = widget.original_widget
+        return type(widget).__name__
+
+    def keypress(self, size, key):
+        self._page_size = size
+        key_started   = time.time()
+        focus_before  = self.focus_position if self.body else None
+        scroll_before = self.get_scrollpos(size, True)
+        unhandled_key = self.handle_key(size, key)
+        
+        # RNS.log(f"  {key}: {unhandled_key} focus {focus_before} -> {self.focus_position if self.body else None} ({self.focused_widget_name()}) scrollpos {scroll_before}->{self.get_scrollpos(size, True)}, {(time.time()-key_started) * 1000:.1f}ms", RNS.LOG_DEBUG)
+        return unhandled_key
+
+    def handle_key(self, size, key):
+        try:
+            if key in ("page up", "page down", "home", "end"):
+                focus_widget = self.focus
+                if focus_widget is not None and focus_widget.selectable():
+                    key = focus_widget.keypress((size[0],), key)
+                    if key is None:
+                        self.make_cursor_visible(size)
+                        return None
+
+                if   key == "page down": self.scroll(size[1] - 1)
+                elif key == "page up":   self.scroll(1 - size[1])
+                elif key == "home":      self.set_scrollpos(0)
+                elif key == "end":       self.set_scrollpos(self.rows_max(size))
+                return None
+
+            unhandled_key = super().keypress(size, key)
+            if key in ("up", "down"): return None
+            return unhandled_key
+
+        except Exception as e:
+            RNS.log(f"Error while handling browser keypress: {e}", RNS.LOG_ERROR)
+            RNS.trace_exception(e)
+            return None
+
+    def mouse_event(self, size, event, button, col, row, focus):
+        self._page_size = size
+        if button in (4, 5): return False
+        return super().mouse_event(size, event, button, col, row, focus)
+
+class Browser:
+    DEFAULT_PATH       = "/page/index.mu"
+    DEFAULT_TIMEOUT    = 10
+    DEFAULT_CACHE_TIME = 12*60*60
+
+    NO_PATH            = 0x00
+    PATH_REQUESTED     = 0x01
+    ESTABLISHING_LINK  = 0x02
+    LINK_TIMEOUT       = 0x03
+    LINK_ESTABLISHED   = 0x04
+    REQUESTING         = 0x05
+    REQUEST_SENT       = 0x06
+    REQUEST_FAILED     = 0x07
+    REQUEST_TIMEOUT    = 0x08
+    RECEIVING_RESPONSE = 0x09
+    DISCONECTED        = 0xFE
+    DONE               = 0xFF
+
+    def __init__(self, app, app_name, aspects, destination_hash = None, path = None, auth_identity = None, delegate = None):
+        self.app = app
+        self.g = self.app.ui.glyphs
+        self.delegate = delegate
+        self.app_name = app_name
+        self.aspects = aspects
+        self.destination_hash = destination_hash
+        self.path = path
+        self.request_data = None
+        self.timeout = Browser.DEFAULT_TIMEOUT
+        self.last_keypress = None
+
+        self.link = None
+        self.loopback = None
+        self.status = Browser.DISCONECTED
+        self.progress_updated_at = None
+        self.previous_progress = 0
+        self.response_progress = 0
+        self.response_speed = None
+        self.response_size = None
+        self.response_transfer_size = None
+        self.page_background_color = None
+        self.page_foreground_color = None
+        self.saved_file_name = None
+        self.saved_file_size = 0
+        self.file_saved_at = 0
+        self.file_save_notice_timeout = 3
+        self.page_data = None
+        self.displayed_page_data = None
+        self.auth_identity = auth_identity
+        self.display_widget = None
+        self.link_status_showing = False
+        self.link_target = None
+        self.frame = None
+        self.attr_maps = []
+        self.page_list = None
+        self.page_rows = []
+        self.page_partials = {}
+        self.page_images = {}
+        self.updater_running = False
+        self.image_updater_running = False
+        self.partial_updater_lock = Lock()
+        self.image_updater_lock = Lock()
+        self.image_cache_lock = Lock()
+        self.image_mode = self.app.config["textui"]["image_loading"]
+        self.image_rendering_supported = _termlib.is_kitty_supported() and self.image_mode != IMGLOAD_NEVER
+        self.build_display()
+
+        self.history = []
+        self.history_ptr = 0
+        self.history_inc = False
+        self.history_dec = False
+        self.reloading = False
+        self.loaded_from_cache = False
+
+        if self.path == None:
+            self.path = Browser.DEFAULT_PATH
+
+        if self.destination_hash != None:
+            self.load_page()
+
+        self.clean_cache()
+
+        if self.image_rendering_supported: RNS.log(f"In-browser image rendering supported", RNS.LOG_DEBUG)
+        else:                              RNS.log(f"In-browser image rendering is not supported", RNS.LOG_DEBUG)
+
+    def current_url(self):
+        if self.destination_hash == None: return ""
+        path = "" if self.path == None else self.path
+        url = RNS.hexrep(self.destination_hash, delimit=False)+":"+path
+
+        if isinstance(self.request_data, dict) and self.request_data:
+            parts = []
+            for k, v in self.request_data.items():
+                if not isinstance(k, str):   continue
+                if not k.startswith("var_"): continue
+                parts.append(k[4:]+"="+str(v))
+            if parts: url += "`" + "|".join(parts)
+
+        return url
+
+    def url_hash(self, url):
+        if url == None: return None
+        else:
+            url = url.encode("utf-8")
+            return RNS.hexrep(RNS.Identity.full_hash(url), delimit=False)
+
+
+    def marked_link(self, link_target, link_fields=None):
+        if link_fields:
+            fields_str = "|".join(link_fields)
+            link_target = f"{link_target}`{fields_str}"
+        if self.status == Browser.DONE:
+            self.link_target = link_target
+            self.app.ui.loop.set_alarm_in(0.1, self.marked_link_job)
+
+    def marked_link_job(self, sender, event):
+        link_target = self.link_target
+        can_display = time.time() > self.file_saved_at + self.file_save_notice_timeout
+
+        if link_target == None:
+            if self.link_status_showing:
+                self.browser_footer = self.make_status_widget()
+                self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+                self.link_status_showing = False
+                if self.page_background_color != None or self.page_foreground_color != None:
+                    style_name = make_style(default_state(fg=self.page_foreground_color, bg=self.page_background_color))
+                    self.browser_footer.set_attr_map({None: style_name})
+        else:
+            if can_display:
+                self.link_status_showing = True
+                lt_str = str(link_target)
+                lmax = self._content_cols()
+                lstr = "Link to "+lt_str
+                if len(lstr) > lmax: lstr = lstr[:lmax-1]+"…"
+                self.browser_footer = urwid.AttrMap(urwid.Pile([urwid.Divider(self.g["divider1"]), urwid.Text(lstr)]), "browser_controls")
+                self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+                if self.page_background_color != None or self.page_foreground_color != None:
+                    style_name = make_style(default_state(fg=self.page_foreground_color, bg=self.page_background_color))
+                    self.browser_footer.set_attr_map({None: style_name})
+
+    def expand_shorthands(self, destination_type):
+        if destination_type == "nnn":
+            return "nomadnetwork.node"
+        elif destination_type == "lxmf":
+            return "lxmf.delivery"
+        elif destination_type == "rrc":
+            return "rrc.hub.session"
+        else:
+            return destination_type
+
+    def handle_link(self, link_target, link_data = None):
+        partial_ids = None
+        request_data = None
+        if link_data != None:
+            link_fields = []
+            request_data = {}
+            all_fields = True if "*" in link_data else False
+
+            for e in link_data:
+                if "=" in e:
+                    c = e.split("=")
+                    if len(c) == 2:
+                        request_data["var_"+str(c[0])] = str(c[1])
+                else:
+                    link_fields.append(e)
+
+                def recurse_down(w):
+                    if isinstance(w, list):
+                        for t in w:
+                            recurse_down(t)
+                    elif isinstance(w, tuple):
+                        for t in w:
+                            recurse_down(t)
+                    elif hasattr(w, "contents"):
+                        recurse_down(w.contents)
+                    elif hasattr(w, "original_widget"):
+                        recurse_down(w.original_widget)
+                    elif hasattr(w, "_original_widget"):
+                        recurse_down(w._original_widget)
+                    else:
+                        if hasattr(w, "field_name") and (all_fields or w.field_name in link_fields):
+                            field_key = "field_" + w.field_name
+                            if isinstance(w, urwid.Edit):
+                                request_data[field_key] = w.edit_text
+                            elif isinstance(w, urwid.RadioButton):
+                                if w.state:
+                                    user_data = getattr(w, "field_value", None)  
+                                    if user_data is not None:
+                                        request_data[field_key] = user_data
+                            elif isinstance(w, urwid.CheckBox):
+                                user_data = getattr(w, "field_value", "1")
+                                if w.state:
+                                    existing_value = request_data.get(field_key, '')
+                                    if existing_value:
+                                        # Concatenate the new value with the existing one
+                                        request_data[field_key] = existing_value + ',' + user_data
+                                    else:
+                                        # Initialize the field with the current value
+                                        request_data[field_key] = user_data
+                                else:
+                                    pass  # do nothing if checkbox is not check
+
+            recurse_down(self.attr_maps)
+            RNS.log("Including request data: "+str(request_data), RNS.LOG_EXTREME)
+
+        # In-document anchor link (#name or empty #)
+        if link_target.startswith("#"):
+            def df(loop, user_data): self._jump_to_anchor(link_target[1:])
+            nomadnet.NomadNetworkApp.get_shared_instance().ui.loop.set_alarm_in(0.0, df)
+            return
+
+        # rrc://<hex>[:<dest_name>]/<room> URL form
+        if link_target.startswith("rrc://"):
+            self.handle_rrc_link(link_target[6:])
+            return
+
+        components = link_target.split("@")
+        destination_type = None
+
+        if len(components) == 2:
+            destination_type = self.expand_shorthands(components[0])
+            link_target = components[1]
+        elif link_target.startswith("p:"):
+            comps = link_target.split(":")
+            if len(comps) > 1: partial_ids = comps[1:]
+            destination_type = "partial"
+        else:
+            destination_type = "nomadnetwork.node"
+            link_target = components[0]
+
+        if destination_type == "nomadnetwork.node":
+            if self.status >= Browser.DISCONECTED:
+                RNS.log("Browser handling link to: "+str(link_target), RNS.LOG_DEBUG)
+                self.browser_footer = urwid.Text("Opening link to: "+str(link_target))
+                try:
+                    self.retrieve_url(link_target, request_data)
+                except Exception as e:
+                    self.browser_footer = urwid.Text("Could not open link: "+str(e))
+                    self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+            else:
+                RNS.log("Browser already handling link, cannot handle link to: "+str(link_target), RNS.LOG_DEBUG)
+
+        elif destination_type == "lxmf.delivery":
+            RNS.log("Passing LXMF link to handler", RNS.LOG_DEBUG)
+            self.handle_lxmf_link(link_target)
+
+        elif destination_type == "rrc.hub.session":
+            RNS.log("Passing RRC link to handler", RNS.LOG_DEBUG)
+            self.handle_rrc_link(link_target)
+
+        elif destination_type == "partial":
+            if partial_ids != None and len(partial_ids) > 0: self.handle_partial_updates(partial_ids)
+
+        else:
+            RNS.log("No known handler for destination type "+str(destination_type), RNS.LOG_DEBUG)
+            self.browser_footer = urwid.Text("Could not open link: "+"No known handler for destination type "+str(destination_type))
+            self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+
+    def _jump_to_anchor(self, name):
+        anchors     = getattr(self.attr_maps, "anchors", None) or {}
+        header_rows = getattr(self.attr_maps, "header_rows", None) or []
+
+        target_idx = None
+        if name:
+            target_idx = anchors.get(name)
+            if target_idx is None:
+                self.browser_footer = urwid.Text("Unknown anchor: #"+name)
+                self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+                return
+        else:
+            current = 0
+            try:
+                current = self.page_rows[self.page_list.top_position()]
+            except Exception:
+                current = 0
+            for hr in header_rows:
+                if hr > current:
+                    target_idx = hr
+                    break
+            if target_idx is None:
+                return
+
+        self.reveal_index(int(target_idx))
+
+        try:
+            self.page_list.set_focus(self.page_rows.index(int(target_idx)))
+            self.page_list.set_focus_valign("top")
+
+        except Exception as e: RNS.log("Anchor jump failed: "+str(e), RNS.LOG_ERROR)
+
+    def _content_cols(self):
+        try:
+            lw = self.delegate.given_list_width
+            screen_cols = self.app.ui.loop.screen.get_cols_rows()[0]
+            browser_cols = screen_cols-lw-2
+            cols = browser_cols
+
+        except Exception as e:
+            RNS.log(f"Could not calculate browser width, anchors will be inaccurate: {e}", RNS.LOG_WARNING)
+            RNS.trace_exception(e)
+            cols = 100
+
+        return max(40, cols)
+
+    def handle_lxmf_link(self, link_target):
+        try:
+            def san(name):
+                if self.app.config["textui"]["sanitize_names"]: return sanitize_name(name)
+                else:                                           return strip_modifiers(name)
+
+            if not type(link_target) is str:
+                raise ValueError("Invalid data type for LXMF link")
+
+            if len(link_target) != (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
+                raise ValueError("Invalid length for LXMF link")
+
+            try:
+                bytes.fromhex(link_target)
+
+            except Exception as e:
+                raise ValueError("Could not decode destination hash from LXMF link")
+
+            existing_conversations = nomadnet.Conversation.conversation_list(self.app)
+            
+            source_hash_text = link_target
+            display_name_data = RNS.Identity.recall_app_data(bytes.fromhex(source_hash_text))
+
+            display_name = None
+            if display_name_data != None:
+                display_name = san(LXMF.display_name_from_app_data(display_name_data))
+
+            if not source_hash_text in [c[0] for c in existing_conversations]:
+                entry = DirectoryEntry(bytes.fromhex(source_hash_text), display_name=display_name)
+                self.app.directory.remember(entry)
+
+                new_conversation = nomadnet.Conversation(source_hash_text, nomadnet.NomadNetworkApp.get_shared_instance(), initiator=True)
+                self.app.ui.main_display.sub_displays.conversations_display.update_conversation_list()
+
+            self.app.ui.main_display.sub_displays.conversations_display.display_conversation(None, source_hash_text)
+            self.app.ui.main_display.show_conversations(None)
+
+        except Exception as e:
+            RNS.log("Error while starting conversation from link. The contained exception was: "+str(e), RNS.LOG_ERROR)
+            self.browser_footer = urwid.Text("Could not open LXMF link: "+str(e))
+            self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+
+
+    def handle_rrc_link(self, link_target):
+        try:
+            if not isinstance(link_target, str):
+                raise ValueError("invalid RRC link payload")
+            rest = link_target.strip()
+            if rest.startswith("/"):
+                rest = rest[1:]
+            hub_part, _, room = rest.partition("/")
+            hex_part, _, dest = hub_part.partition(":")
+            hex_part = hex_part.strip()
+            dest = dest.strip() or None
+            try:
+                hub_hash = bytes.fromhex(hex_part)
+            except Exception:
+                raise ValueError("invalid hub hash")
+            expected_len = RNS.Reticulum.TRUNCATED_HASHLENGTH // 8
+            if len(hub_hash) != expected_len:
+                raise ValueError("hub hash must be "+str(expected_len)+" bytes")
+
+            room = room.strip().lstrip("#").strip()
+            room_norm = room.lower() if room else None
+
+            existing = self.app.rrc.find_hub(hub_hash, dest_name=dest)
+            self.app.ui.main_display.show_channels(None)
+            channels = self.app.ui.main_display.sub_displays.channels_display
+
+            if existing is not None:
+                channels.update_list()
+                if room_norm:
+                    channels._select_room(None, (existing, room_norm))
+                else:
+                    channels._select_hub(None, existing)
+                return
+
+
+            channels.confirm_new_hub_dialog(hub_hash, dest, room_norm)
+
+        except Exception as e:
+            RNS.log("Could not open RRC link: "+str(e), RNS.LOG_ERROR)
+            self.browser_footer = urwid.Text("Could not open RRC link: "+str(e))
+            self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+
+
+    def micron_released_focus(self):
+        if self.delegate != None:
+            self.delegate.focus_lists()
+
+    def build_display(self):
+        self.browser_header = urwid.Text("")
+        self.browser_footer = urwid.Text("")
+
+        self.page_list = None
+        self.page_rows = []
+        self.page_partials = {}
+        self.page_images = {}
+        self.browser_body = urwid.Filler(
+            urwid.Text("Disconnected\n"+self.g["arrow_l"]+"  "+self.g["arrow_r"], align=urwid.CENTER),
+            urwid.MIDDLE,
+        )
+
+        self.frame = BrowserFrame(self.browser_body, header=self.browser_header, footer=self.browser_footer)
+        self.frame.delegate = self
+        self.linebox = urwid.LineBox(self.frame, title="Remote Node")
+        self.display_widget = urwid.AttrMap(self.linebox, "browser_inactive")
+
+    def make_status_widget(self):
+        if self.response_progress > 0:
+            if self.page_background_color != None or self.page_foreground_color != None:
+                style_name = make_style(default_state(fg=self.page_foreground_color, bg=self.page_background_color))
+                style_name_inverted = make_style(default_state(bg=self.page_foreground_color, fg=self.page_background_color))
+            else:
+                style_name = "progress_empty"
+                style_name_inverted = "progress_full"
+
+            pb = ResponseProgressBar(style_name , style_name_inverted, current=self.response_progress, done=1.0, satt=None, owner=self)
+            widget = urwid.Pile([urwid.Divider(self.g["divider1"]), pb])
+        else:
+            widget = urwid.Pile([urwid.Divider(self.g["divider1"]), urwid.Text(self.status_text())])
+
+        return urwid.AttrMap(widget, "browser_controls")
+
+    def make_control_widget(self):
+        clipboard_copy_enabled = self.app.config["textui"]["clipboard_copy"]
+        copy_glyph = self.g.get("copy", "[C]")
+        lstr = self.g["node"]+" "+self.current_url()
+        if clipboard_copy_enabled:
+            lmax = self._content_cols()-len(copy_glyph)-len(copy_glyph)-1
+        else:
+            lmax = self._content_cols()-1
+        if len(lstr) > lmax: lstr = lstr[:lmax-1]+"…"
+        url_text = urwid.Text(lstr)
+        if clipboard_copy_enabled:
+            copy_icon = ClickableIcon(copy_glyph, on_click=lambda: self.copy_url())
+            copy_width = len(copy_glyph) + 2
+            header_row = urwid.Columns([
+                ("weight", 1, url_text),
+                (copy_width, urwid.Padding(copy_icon, left=1, right=1)),
+            ])
+        else:
+            header_row = url_text
+        return urwid.AttrMap(urwid.Pile([header_row, urwid.Divider(self.g["divider1"])]), "browser_controls")
+
+    def make_request_failed_widget(self):
+        def back_action(sender):
+            self.status = Browser.DONE
+            self.destination_hash = self.previous_destination_hash
+            self.path = self.previous_path
+            self.update_display()
+
+        columns = urwid.Columns([
+            (urwid.WEIGHT, 0.5, urwid.Text(" ")),
+            (8, urwid.Button("Back", on_press=back_action)),
+            (urwid.WEIGHT, 0.5, urwid.Text(" ")),
+        ])
+
+        if len(self.attr_maps) > 0:
+            pile = urwid.Pile([
+                urwid.Text("!\n\n"+self.status_text()+"\n", align=urwid.CENTER),
+                columns
+            ])
+        else:
+            pile = urwid.Pile([urwid.Text("!\n\n"+self.status_text(), align=urwid.CENTER)])
+
+        return urwid.Filler(pile, urwid.MIDDLE)
+    
+    def update_display(self):
+        if self.status == Browser.DISCONECTED:
+            self.display_widget.set_attr_map({None: "browser_inactive"})
+            self.page_list = None
+            self.page_rows = []
+            self.page_partials = {}
+            self.page_images = {}
+            self.browser_body = urwid.Filler(
+                urwid.Text("Disconnected\n"+self.g["arrow_l"]+"  "+self.g["arrow_r"], align=urwid.CENTER),
+                urwid.MIDDLE,
+            )
+            self.browser_footer = urwid.Text("")
+            self.browser_header = urwid.Text("")
+            self.linebox.set_title("Remote Node")
+        else:
+            self.display_widget.set_attr_map({None: "body_text"})
+            self.browser_header = self.make_control_widget()
+            if self.page_background_color != None or self.page_foreground_color != None:
+                style_name = make_style(default_state(fg=self.page_foreground_color, bg=self.page_background_color))
+                self.browser_header.set_attr_map({None: style_name})
+
+            if self.destination_hash != None:
+                remote_display_string = self.app.directory.simplest_display_str(self.destination_hash)
+            else:
+                remote_display_string = ""
+
+            if self.loopback != None and remote_display_string == RNS.prettyhexrep(self.loopback):
+                remote_display_string = self.app.node.name
+
+            self.linebox.set_title(remote_display_string)
+
+            if self.status == Browser.DONE:
+                self.browser_footer = self.make_status_widget()
+                self.update_page_display()
+
+                if self.page_background_color != None or self.page_foreground_color != None:
+                    style_name = make_style(default_state(fg=self.page_foreground_color, bg=self.page_background_color))
+                    self.browser_body.set_attr_map({None: style_name})
+                    self.browser_footer.set_attr_map({None: style_name})
+                    self.browser_header.set_attr_map({None: style_name})
+                    self.display_widget.set_attr_map({None: style_name})
+            
+            elif self.status == Browser.LINK_TIMEOUT:
+                self.browser_body = self.make_request_failed_widget()
+                self.browser_footer = urwid.Text("")
+            
+            elif self.status <= Browser.REQUEST_SENT:
+                if len(self.attr_maps) == 0:
+                    self.browser_body = urwid.Filler(
+                        urwid.Text("Retrieving\n["+self.current_url()+"]", align=urwid.CENTER),
+                        urwid.MIDDLE,
+                    )
+
+                self.browser_footer = self.make_status_widget()
+
+                if self.page_background_color != None or self.page_foreground_color != None:
+                    style_name = make_style(default_state(fg=self.page_foreground_color, bg=self.page_background_color))
+                    self.browser_footer.set_attr_map({None: style_name})
+                    self.browser_header.set_attr_map({None: style_name})
+                    self.display_widget.set_attr_map({None: style_name})
+            
+            elif self.status == Browser.REQUEST_FAILED:
+                self.browser_body = self.make_request_failed_widget()
+                self.browser_footer = urwid.Text("")
+            
+            elif self.status == Browser.REQUEST_TIMEOUT:
+                self.browser_body = self.make_request_failed_widget()
+                self.browser_footer = urwid.Text("")
+            
+            else:
+                pass
+
+        self.frame.contents["body"] = (self.browser_body, self.frame.options())
+        self.frame.contents["header"] = (self.browser_header, self.frame.options())
+        self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+
+    def update_page_display(self):
+        self._purge_page_images()
+        self.page_rows = list(range(len(self.attr_maps)))
+        self.page_list = PageList(urwid.SimpleFocusListWalker(list(self.attr_maps)))
+        self.page_partials = {}
+        self.page_images = {}
+        self.browser_body = urwid.AttrMap(ScrollBar(self.page_list, thumb_char="\u2503", trough_char=" "), "scrollbar")
+        self.detect_partials()
+        if self.should_load_images(): self.detect_images()
+        self.init_folds()
+
+    def refresh_page_layout(self):
+        if self.page_list is not None: self.page_list.invalidate_layout()
+
+    def image_cache_path(self, url):
+        destination_hash, path = self.parse_url(url)
+        url = f"{RNS.hexrep(destination_hash, delimit=False)}:{path}"
+        url_hash = self.url_hash(url)
+        if not url_hash: return None
+        else:
+            path = f"{self.app.imagecachepath}/{url_hash}"
+            return path
+
+    def resolve_image(self, url):
+        cachepath = self.image_cache_path(url)
+        if not cachepath: return None
+        else:
+            if os.path.exists(cachepath): return cachepath
+            else: return None
+
+    def _purge_page_images(self):
+        if not self.image_rendering_supported: return
+        try:
+            screen = getattr(getattr(self.app.ui, "loop", None), "screen", None)
+            if hasattr(screen, "purge_images"): screen.purge_images()
+        except Exception: pass
+
+    def should_load_images(self):
+        if   self.image_mode == IMGLOAD_NEVER:  return False
+        elif self.image_mode == IMGLOAD_MANUAL: return False
+        elif self.image_mode == IMGLOAD_ALWAYS: return True
+        elif self.image_mode == IMGLOAD_AUTO:
+            if self.destination_hash == self.loopback: return True
+            rtt_limit = 1.5; edr_limit = 10000
+            if self.link:
+                rtt = self.link.rtt
+                edr = self.link.get_expected_rate() or self.last_response_speed()
+                rtt_ok = rtt and rtt < rtt_limit
+                edr_ok = edr and edr > edr_limit
+                RNS.log(f"Checking image load conditions, RTT is {RNS.prettyshorttime(rtt) if rtt else 'unknown'}, EDR is {RNS.prettyspeed(edr) if edr else 'unknown'}", RNS.LOG_DEBUG)
+                if rtt_ok and edr_ok: return True
+                else:                 return False
+
+        return False
+
+    def load_images(self, force_reload=False):
+        if not self.image_rendering_supported: return
+        elif self.image_mode == IMGLOAD_NEVER: return
+        else: self.detect_images(force_reload=force_reload)
+
+    def detect_images(self, force_reload=False):
+        if not self.image_rendering_supported: return
+        for w in self.attr_maps:
+            o = w._original_widget
+            if hasattr(o, "_contained_image"): o = o._contained_image
+            if hasattr(o, "image_url"):
+                resolved_image = self.resolve_image(o.image_url)
+                if resolved_image and force_reload:
+                    RNS.log(f"Clearing image cache for {o.image_url} ({resolved_image})", RNS.LOG_DEBUG)
+                    try: os.unlink(resolved_image)
+                    except Exception as e: RNS.log(f"Could not clear image cache for {o.image_url}: {e}", RNS.LOG_ERROR)
+                    resolved_image = None
+
+                if   force_reload: continue
+                elif resolved_image and self.image_rendering_supported: o.load(resolved_image, remote_source=True)
+                else:
+                    image = { "widget": o, "id": o.image_id, "url": o.image_url, "refresh": None, "updated": None,
+                              "update_requested": None, "request_id": None, "link": None, "failed": False, "pr_throttle": 0,
+                              "progress_updated": None, "previous_progress": 0 }
+
+                    self.page_images[o.image_id] = image
+
+        self.refresh_page_layout()
+        if   force_reload: self.reload()
+        elif len(self.page_images) > 0: self.start_image_updater()
+
+    def start_image_updater(self):
+        if not self.image_rendering_supported: return
+        if not self.image_updater_running: self.update_images()
+
+    def update_images(self, loop=None, user_data=None):
+        if not self.image_rendering_supported: return
+        def job():
+            if self.image_updater_lock.locked(): return
+            with self.image_updater_lock:
+                self.image_updater_running = True
+
+                for iid in self.page_images:
+                    try:
+                        image = self.page_images[iid]
+                        if image["failed"]: continue
+                        if not image["updated"] or (image["refresh"] != None and time.time() > image["updated"]+image["refresh"]):
+                            image["update_requested"] = time.time()
+                            self.__load_image(image)
+                            while not image["updated"] and not image["failed"] and len(self.page_images) > 0: time.sleep(0.2)
+
+                    except Exception as e: RNS.log(f"Error updating page image: {e}", RNS.LOG_ERROR)
+                
+                if len(self.page_images) > 0: self.app.ui.loop.set_alarm_in(1, self.update_images)
+                else:                         self.image_updater_running = False
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def __load_image(self, image):
+        if image["failed"] == True: return
+        w = image["widget"]
+        url = image["url"]
+        try: image_destination_hash, path = self.parse_url(image["url"])
+        except Exception as e:
+            RNS.log(f"Could not parse image URL: {e}", RNS.LOG_ERROR)
+            image["failed"] = True
+            w.notice(f"Could not load image {url}: {e}")
+            return
+
+        if image_destination_hash == self.loopback:
+            local_image = path.replace("/media/", "")
+            local_path = f"{self.app.pagespath}/{local_image}"
+
+            if self.app.node:
+                image_ext = os.path.splitext(local_path)[-1]
+                if not image_ext in self.app.node.NATIVE_MEDIA_EXTS:
+                    RNS.log(f"Non-native media type for {local_path}, attempting auto-conversion", RNS.LOG_DEBUG)
+                    local_path = self.app.node.convert_media_to_webp(local_path)
+
+            if self.image_rendering_supported:
+                w.load(local_path)
+                self.refresh_page_layout()
+            image["updated"] = time.time()
+            return
+
+        if not RNS.Transport.has_path(image_destination_hash):
+            if time.time() <= image["pr_throttle"]: return
+            else:
+                image["pr_throttle"] = time.time()+15
+                RNS.log(f"Requesting path for image: {path}", RNS.LOG_DEBUG)
+                RNS.Transport.request_path(image_destination_hash)
+                pr_time = time.time()+self.path_timeout(image_destination_hash)
+                while not RNS.Transport.has_path(image_destination_hash):
+                    if time.time() > pr_time: return
+                    time.sleep(0.25)
+
+        if not image["link"]:
+            if self.link and self.link.destination.hash == image_destination_hash and self.link.status == RNS.Link.ACTIVE:
+                image["link"] = self.link
+                RNS.log(f"Re-using existing page link for image {url}", RNS.LOG_EXTREME)
+
+        if not image["link"]:
+            for pid in self.page_images:
+                other_image = self.page_images[pid]
+                if other_image["link"]:
+                    existing_link = other_image["link"]
+                    if existing_link.destination.hash == image_destination_hash and existing_link.status == RNS.Link.ACTIVE:
+                        RNS.log(f"Re-using existing link for image {url}", RNS.LOG_EXTREME)
+                        image["link"] = existing_link
+                        break
+
+        if not image["link"] or (image["link"] and image["link"].status) == RNS.Link.CLOSED:
+            RNS.log(f"Establishing link for image: {image_destination_hash} / {path}", RNS.LOG_DEBUG)
+            identity = RNS.Identity.recall(image_destination_hash)
+            destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, self.app_name, self.aspects)
+            w.notice(f"Establishing link...")
+            
+            def f_established(wd):
+                def established(link):
+                    RNS.log(f"Link established for image: {path}", RNS.LOG_DEBUG)
+                    wd.notice(f"Link established")
+                return established
+
+            def f_closed(wd):
+                def closed(link):
+                    RNS.log(f"Link closed for image: {path}", RNS.LOG_DEBUG)
+                    image["link"] = None
+                    image["failed"] = True
+                    wd.notice(f"Link closed during transfer")
+                return closed
+            
+            image["link"] = RNS.Link(destination, established_callback = f_established(w), closed_callback = f_closed(w))
+            timeout = time.time()+max(self.timeout, image["link"].establishment_timeout)
+            while image["link"].status != RNS.Link.ACTIVE and time.time() < timeout: time.sleep(0.1)
+
+        if image["link"] and image["link"].status == RNS.Link.ACTIVE and image["request_id"] == None:
+            RNS.log(f"Sending request for image: {path}", RNS.LOG_DEBUG)
+            receipt = image["link"].request("/media", data=self.__get_image_request_data(image), response_callback = self.image_received,
+                                            failed_callback = self.image_failed, progress_callback = self.image_progressed)
+            w.notice(f"Request sent")
+
+            if receipt: image["request_id"] = receipt.request_id
+            else:
+                RNS.log(f"Image request failed", RNS.LOG_ERROR)
+                image["failed"] = True
+                w.notice(f"Request failed")
+
+    def __get_image_request_data(self, image):
+        destination_hash, path = self.parse_url(image["url"])
+        request_data = {"path": path, "key": None}
+        return request_data
+
+    def image_failed(self, request_receipt):
+        RNS.log("Loading page image failed", RNS.LOG_ERROR)
+        for iid in self.page_images:
+            image = self.page_images[iid]
+            if image["request_id"] == request_receipt.request_id:
+                try:
+                    image["updated"] = time.time()
+                    image["request_id"] = None
+                    image["failed"] = True
+                    url = image["url"]
+                    w = image["widget"]
+                    w.notice(f"Could not load image {url}")
+                except Exception as e:
+                    RNS.log(f"Error in image failed callback: {e}", RNS.LOG_ERROR)
+                    RNS.trace_exception(e)
+
+    def image_progressed(self, request_receipt):
+        for iid in self.page_images:
+            i = self.page_images[iid]
+            if i["request_id"] == request_receipt.request_id:
+                try:
+                    response_progress      = request_receipt.progress
+                    response_time          = request_receipt.get_response_time()
+                    response_size          = request_receipt.response_size
+                    response_transfer_size = request_receipt.response_transfer_size
+                    
+                    w = i["widget"]
+                    now = time.time()
+                    if i["progress_updated"] == None: i["progress_updated"] = now
+                    if now > i["progress_updated"]+0.5:
+                        td = now - i["progress_updated"]
+                        pd = response_progress - i["previous_progress"]
+                        bd = pd*response_transfer_size
+                        response_speed = (bd/td)*8
+                        i["previous_progress"] = response_progress
+                        i["progress_updated"] = now
+                        stats = f"{round(response_progress*100, 2)}% ({RNS.prettysize(response_progress*response_size)} of {RNS.prettysize(response_size)}) - {RNS.prettyspeed(response_speed)}"
+                        w.notice(stats)
+
+                except Exception as e: RNS.trace_exception(e)
+
+    def image_received(self, request_receipt):
+        if not request_receipt.response: self.image_failed(request_receipt)
+        for iid in self.page_images:
+            image = self.page_images[iid]
+            if image["request_id"] == request_receipt.request_id:
+                try:
+                    image["updated"] = image["update_requested"]
+                    image["request_id"] = None
+                    w = image["widget"]
+                    w.notice(f"Image loaded")
+                
+                except Exception as e:
+                    RNS.log(f"Error while loading received image: {e}", RNS.LOG_ERROR)
+                    RNS.trace_exception(e)
+                    image["failed"] = True
+
+                try:
+                    url = image["url"]
+                    cachepath = self.image_cache_path(url)
+                    if isinstance(request_receipt.response, bytes):
+                        with open(cachepath, "wb") as f: f.write(request_receipt.response)
+
+                    elif type(request_receipt.response) == io.BufferedReader:
+                        if request_receipt.metadata != None:
+                            file_handle = request_receipt.response
+                            file_destination = cachepath
+                            shutil.move(file_handle.name, file_destination)
+                            threading.Thread(target=self.clean_image_cache, daemon=True).start()
+
+                    resolved_path = self.resolve_image(url)
+                    if resolved_path and self.image_rendering_supported:
+                        w.load(resolved_path, remote_source=True)
+                        self.refresh_page_layout()
+
+                except Exception as e:
+                    RNS.log("Error while handling image response: "+str(e), RNS.LOG_ERROR)
+                    image["failed"] = True
+
+    IMAGE_CACHE_MAX_FILES = 256
+    IMAGE_CACHE_MAX_BYTES = 192*1024*1024
+    def clean_image_cache(self):
+        if self.image_cache_lock.locked(): return
+        with self.image_cache_lock:
+            try:
+                entries = []
+                for name in os.listdir(self.app.imagecachepath):
+                    path = os.path.join(self.app.imagecachepath, name)
+                    try:
+                        st = os.stat(path)
+                        if st.st_size > 0: entries.append((st.st_mtime, st.st_size, path))
+                    except OSError as exc: RNS.log(f"Could not get cached file information for {path}: {e}", RNS.LOG_DEBUG)
+
+                cleaned_b = 0; cleaned_c = 0
+                total = sum(e[1] for e in entries)
+                entries.sort()
+                while len(entries) > self.IMAGE_CACHE_MAX_FILES or total > self.IMAGE_CACHE_MAX_BYTES:
+                    _, size, path = entries.pop(0)
+                    total -= size
+                    cleaned_b += size
+                    cleaned_c += 1
+                    try: os.unlink(path)
+                    except OSError as exc: RNS.log(f"Could not remove cached file {path}: {exc}")
+                if cleaned_b or cleaned_c: RNS.log(f"Cleaned {RNS.prettysize(cleaned_b)} / {cleaned_c} image{'s' if cleaned_c != 1 else ''} from cache", RNS.LOG_DEBUG)
+            except Exception as exc: RNS.log(f"Error while cleaning browser image cache: {exc}", RNS.LOG_ERROR)
+
+    # Render an arbitrary markup buffer (used by the page editor preview) and
+    # return the content widget, with partials/folds/fields wired as usual
+    def render_markup_buffer(self, markup):
+        self.status = Browser.DONE
+        self.markup = markup
+        self.page_background_color = None
+        self.page_foreground_color = None
+        for tag, attr in (("#!bg=", "page_background_color"), ("#!fg=", "page_foreground_color")):
+            pos = markup.find(tag)
+            if pos >= 0:
+                endpos = markup.find("\n", pos)
+                if endpos < 0: endpos = len(markup)
+                if endpos-(pos+len(tag)) in (3, 6):
+                    setattr(self, attr, markup[pos+len(tag):endpos])
+        try:
+            self.attr_maps = markup_to_attrmaps(strip_modifiers(markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+        except Exception as e:
+            self.attr_maps = [urwid.AttrMap(urwid.Text(f"Could not render preview: {e}"), "browser_inactive")]
+        self.update_page_display()
+        return self.browser_body
+
+    def init_folds(self):
+        self.fold_sections = {}
+        self.collapsed_headings = set()
+        attrmaps = self.attr_maps
+        header_levels = getattr(attrmaps, "header_levels", None) or {}
+        row_levels    = getattr(attrmaps, "row_levels", None) or {}
+        collapsibles  = getattr(attrmaps, "collapsibles", None) or {}
+        if not collapsibles:
+            return
+
+        n = len(attrmaps)
+        for idx in sorted(collapsibles.keys()):
+            widget = self.collapsible_widget_at(idx)
+            if widget is None: continue
+            depth = header_levels.get(idx, 1)
+            end = n
+            for i in range(idx+1, n):
+                if row_levels.get(i, depth) < depth or \
+                   (i in header_levels and header_levels.get(i, 1) <= depth):
+                    end = i; break
+            self.fold_sections[widget] = (idx+1, end)
+            if collapsibles[idx]:
+                self.collapsed_headings.add(widget)
+                try: widget.set_collapsed(True)
+                except Exception: pass
+
+        if self.collapsed_headings:
+            self.rebuild_visible()
+
+    def collapsible_widget_at(self, idx):
+        try:
+            o = self.attr_maps[idx]._original_widget
+            if getattr(o, "is_collapsible_heading", False): return o
+        except Exception: pass
+        return None
+
+    def hidden_indices(self):
+        hidden = set()
+        for widget in getattr(self, "collapsed_headings", ()):
+            rng = getattr(self, "fold_sections", {}).get(widget)
+            if rng: hidden.update(range(rng[0], rng[1]))
+        return hidden
+
+    def rebuild_visible(self):
+        page = getattr(self, "page_list", None)
+        if page is None: return
+        hidden = self.hidden_indices()
+        self.page_rows = [i for i in range(len(self.attr_maps)) if i not in hidden]
+        focus = page.focus_position if page.body else 0
+        page.body[:] = [self.attr_maps[i] for i in self.page_rows]
+        page.invalidate_layout()
+        if page.body: page.set_focus(min(focus, len(page.body)-1))
+
+    def fold_changed(self, heading_widget):
+        if getattr(heading_widget, "collapsed", False):
+            self.collapsed_headings.add(heading_widget)
+        else:
+            self.collapsed_headings.discard(heading_widget)
+        self.rebuild_visible()
+        try:
+            for pos, w in enumerate(self.page_list.body):
+                if getattr(w, "_original_widget", None) is heading_widget:
+                    self.page_list.set_focus(pos)
+                    break
+        except Exception: pass
+
+    def reveal_index(self, idx):
+        changed = False
+        for widget in list(getattr(self, "collapsed_headings", ())):
+            rng = getattr(self, "fold_sections", {}).get(widget)
+            if rng and rng[0] <= idx < rng[1]:
+                self.collapsed_headings.discard(widget)
+                try: widget.set_collapsed(False)
+                except Exception: pass
+                changed = True
+        if changed: self.rebuild_visible()
+
+    def parse_url(self, url):
+        path = None
+        destination_hash = None
+        components = url.split(":")
+        if len(components) == 1:
+            if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
+                path = Browser.DEFAULT_PATH
+            else: raise ValueError("Malformed URL")
+        elif len(components) == 2:
+            if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
+                path = components[1]
+                if len(path) == 0: path = Browser.DEFAULT_PATH
+            else:
+                if len(components[0]) == 0:
+                    if self.destination_hash != None:
+                        destination_hash = self.destination_hash
+                        path = components[1]
+                        if len(path) == 0: path = Browser.DEFAULT_PATH
+                    else: raise ValueError("Malformed URL")
+                else: raise ValueError("Malformed URL")
+        else: raise ValueError("Malformed URL")
+
+        return destination_hash, path
+
+    def detect_partials(self):
+        for w in self.attr_maps:
+            o = w._original_widget
+            if hasattr(o, "partial_hash"):
+                RNS.log(f"Found partial: {o.partial_hash} / {o.partial_url} / {o.partial_refresh}")
+                partial = {"hash": o.partial_hash, "id": o.partial_id, "url": o.partial_url, "fields": o.partial_fields,
+                           "refresh": o.partial_refresh, "content": None, "updated": None, "update_requested": None, "request_id": None,
+                            "destination": None, "link": None, "pile": o, "attr_maps": None, "failed": False, "pr_throttle": 0}
+
+                self.page_partials[o.partial_hash] = partial
+
+        if len(self.page_partials) > 0: self.start_partial_updater()
+
+    def partial_failed(self, request_receipt):
+        RNS.log("Loading page partial failed", RNS.LOG_ERROR)
+        for pid in self.page_partials:
+            partial = self.page_partials[pid]
+            if partial["request_id"] == request_receipt.request_id:
+                try:
+                    partial["updated"] = time.time()
+                    partial["request_id"] = None
+                    partial["content"] = None
+                    partial["attr_maps"] = None
+                    url = partial["url"]
+                    pile = partial["pile"]
+                    pile.contents = [(urwid.Text(f"Could not load partial {url}: The resource transfer failed"), pile.options())]
+                    self.refresh_page_layout()
+                except Exception as e:
+                    RNS.log(f"Error in partial failed callback: {e}", RNS.LOG_ERROR)
+                    RNS.trace_exception(e)
+
+    def partial_progressed(self, request_receipt):
+        pass
+
+    def partial_received(self, request_receipt):
+        for pid in self.page_partials:
+            partial = self.page_partials[pid]
+            if partial["request_id"] == request_receipt.request_id:
+                try:
+                    partial["updated"] = partial["update_requested"]
+                    partial["request_id"] = None
+                    partial["content"] = request_receipt.response.decode("utf-8").rstrip()
+                    partial["attr_maps"] = markup_to_attrmaps(strip_modifiers(partial["content"]), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+                    pile = partial["pile"]
+                    pile.contents = [(e, pile.options()) for e in partial["attr_maps"]]
+                    self.refresh_page_layout()
+
+                except Exception as e:
+                    RNS.trace_exception(e)
+
+    def __load_partial(self, partial):
+        if partial["failed"] == True: return
+        try: partial_destination_hash, path = self.parse_url(partial["url"])
+        except Exception as e:
+            RNS.log(f"Could not parse partial URL: {e}", RNS.LOG_ERROR)
+            partial["failed"] = True
+            pile = partial["pile"]
+            url = partial["url"]
+            pile.contents = [(urwid.Text(f"Could not load partial {url}: {e}"), pile.options())]
+            self.refresh_page_layout()
+            return
+
+        if partial_destination_hash != self.loopback and not RNS.Transport.has_path(partial_destination_hash):
+            if time.time() <= partial["pr_throttle"]: return
+            else:
+                partial["pr_throttle"] = time.time()+15
+                RNS.log(f"Requesting path for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+                RNS.Transport.request_path(partial_destination_hash)
+                pr_time = time.time()+self.path_timeout(partial_destination_hash)
+                while not RNS.Transport.has_path(partial_destination_hash):
+                    if time.time() > pr_time: return
+                    time.sleep(0.25)
+
+        for pid in self.page_partials:
+            other_partial = self.page_partials[pid]
+            if other_partial["link"]:
+                existing_link = other_partial["link"]
+                if existing_link.destination.hash == partial_destination_hash and existing_link.status == RNS.Link.ACTIVE:
+                    RNS.log(f"Re-using existing link: {existing_link}", RNS.LOG_EXTREME)
+                    partial["link"] = existing_link
+                    break
+
+        if not partial["link"] or partial["link"].status == RNS.Link.CLOSED:
+            RNS.log(f"Establishing link for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+            identity = RNS.Identity.recall(partial_destination_hash)
+            destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, self.app_name, self.aspects)
+            
+            def established(link):
+                RNS.log(f"Link established for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+
+            def closed(link):
+                RNS.log(f"Link closed for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+                partial["link"] = None
+            
+            partial["link"] = RNS.Link(destination, established_callback = established, closed_callback = closed)
+            timeout = time.time()+max(self.timeout, partial["link"].establishment_timeout)
+            while partial["link"].status != RNS.Link.ACTIVE and time.time() < timeout: time.sleep(0.1)
+
+        if partial["link"] and partial["link"].status == RNS.Link.ACTIVE and partial["request_id"] == None:
+            RNS.log(f"Sending request for partial: {partial_destination_hash} / {path}", RNS.LOG_EXTREME)
+            receipt = partial["link"].request(path, data=self.__get_partial_request_data(partial), response_callback = self.partial_received,
+                                              failed_callback = self.partial_failed, progress_callback = self.partial_progressed)
+
+            if receipt: partial["request_id"] = receipt.request_id
+            else: RNS.log(f"Partial request failed", RNS.LOG_ERROR)
+
+    def __get_partial_request_data(self, partial):
+        request_data = None
+        if partial["fields"] != None:
+            link_data = partial["fields"]
+            link_fields = []
+            request_data = {}
+            all_fields = True if "*" in link_data else False
+
+            for e in link_data:
+                if "=" in e:
+                    c = e.split("=")
+                    if len(c) == 2:
+                        request_data["var_"+str(c[0])] = str(c[1])
+                else:
+                    link_fields.append(e)
+
+                def recurse_down(w):
+                    if isinstance(w, list):
+                        for t in w:
+                            recurse_down(t)
+                    elif isinstance(w, tuple):
+                        for t in w:
+                            recurse_down(t)
+                    elif hasattr(w, "contents"):
+                        recurse_down(w.contents)
+                    elif hasattr(w, "original_widget"):
+                        recurse_down(w.original_widget)
+                    elif hasattr(w, "_original_widget"):
+                        recurse_down(w._original_widget)
+                    else:
+                        if hasattr(w, "field_name") and (all_fields or w.field_name in link_fields):
+                            field_key = "field_" + w.field_name
+                            if isinstance(w, urwid.Edit):
+                                request_data[field_key] = w.edit_text
+                            elif isinstance(w, urwid.RadioButton):
+                                if w.state:
+                                    user_data = getattr(w, "field_value", None)  
+                                    if user_data is not None:
+                                        request_data[field_key] = user_data
+                            elif isinstance(w, urwid.CheckBox):
+                                user_data = getattr(w, "field_value", "1")
+                                if w.state:
+                                    existing_value = request_data.get(field_key, '')
+                                    if existing_value:
+                                        # Concatenate the new value with the existing one
+                                        request_data[field_key] = existing_value + ',' + user_data
+                                    else:
+                                        # Initialize the field with the current value
+                                        request_data[field_key] = user_data
+                                else:
+                                    pass  # do nothing if checkbox is not check
+
+            recurse_down(self.attr_maps)
+            RNS.log("Including request data: "+str(request_data), RNS.LOG_EXTREME)
+
+        return request_data
+
+    def start_partial_updater(self):
+        if not self.updater_running: self.update_partials()
+
+    def handle_partial_updates(self, partial_ids):
+        RNS.log(f"Update partials: {partial_ids}")
+        def job():
+            for pid in self.page_partials:
+                try:
+                    partial = self.page_partials[pid]
+                    if partial["id"] in partial_ids:
+                        partial["update_requested"] = time.time()
+                        self.__load_partial(partial)
+                except Exception as e: RNS.log(f"Error updating page partial: {e}", RNS.LOG_ERROR)
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def update_partials(self, loop=None, user_data=None):
+        with self.partial_updater_lock:
+            def job():
+                for pid in self.page_partials:
+                    try:
+                        partial = self.page_partials[pid]
+                        if partial["failed"]: continue
+                        if not partial["updated"] or (partial["refresh"] != None and time.time() > partial["updated"]+partial["refresh"]):
+                            partial["update_requested"] = time.time()
+                            self.__load_partial(partial)
+                    except Exception as e: RNS.log(f"Error updating page partial: {e}", RNS.LOG_ERROR)
+
+            threading.Thread(target=job, daemon=True).start()
+            
+            if len(self.page_partials) > 0:
+                self.updater_running = True
+                self.app.ui.loop.set_alarm_in(1, self.update_partials)
+            else:
+                self.updater_running = False
+
+    def identify(self):
+        if self.link != None:
+            if self.link.status == RNS.Link.ACTIVE:
+                self.link.identify(self.auth_identity)
+
+
+    def disconnect(self):
+        if self.link != None:
+            self.link.teardown()
+        
+        self.request_data = None
+        self.attr_maps = []
+        self.status = Browser.DISCONECTED
+        self.response_progress = 0
+        self.response_speed = None
+        self.progress_updated_at = None
+        self.previous_progress = 0
+        self.response_size = None
+        self.response_transfer_size = None
+
+        self.history = []
+        self.history_ptr = 0
+        self.history_inc = False
+        self.history_dec = False
+
+        self.update_display()
+
+
+    def retrieve_url(self, url, request_data = None):
+        components = url.split("`")
+        if len(components) == 2:
+            url = components[0]
+            try:
+                link_fields_str = components[1]
+                if link_fields_str != "":
+                    if not request_data: request_data = {}
+                    for e in link_fields_str.split("|"):
+                        if "=" in e:
+                            c = e.split("=")
+                            if len(c) == 2:
+                                request_data["var_"+str(c[0])] = str(c[1])
+            
+            except Exception as e:
+                RNS.log(f"Malformed URL: {e}", RNS.LOG_WARNING)
+                raise ValueError(f"Malformed URL: {e}")
+
+        self.previous_destination_hash = self.destination_hash
+        self.previous_path = self.path
+
+        destination_hash = None
+        path = None
+
+        components = url.split(":")
+        if len(components) == 1:
+            if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
+                path = Browser.DEFAULT_PATH
+            else: raise ValueError("Malformed URL")
+        elif len(components) == 2:
+            if len(components[0]) == (RNS.Reticulum.TRUNCATED_HASHLENGTH//8)*2:
+                try: destination_hash = bytes.fromhex(components[0])
+                except Exception as e: raise ValueError("Malformed URL")
+                path = components[1]
+                if len(path) == 0: path = Browser.DEFAULT_PATH
+            else:
+                if len(components[0]) == 0:
+                    if self.destination_hash != None:
+                        destination_hash = self.destination_hash
+                        path = components[1]
+                        if len(path) == 0: path = Browser.DEFAULT_PATH
+                    else: raise ValueError("Malformed URL")
+                else: raise ValueError("Malformed URL")
+        else: raise ValueError("Malformed URL")
+
+        if destination_hash != None and path != None:
+            if path.startswith("/file/"):
+                if destination_hash != self.loopback:
+                    if destination_hash == self.destination_hash:
+                        self.download_file(destination_hash, path, data=request_data)
+                    else:
+                        RNS.log("Cannot request file download from a node that is not currently connected.", RNS.LOG_ERROR)
+                        RNS.log("The requested URL was: "+str(url), RNS.LOG_ERROR)
+                else:
+                    self.download_local_file(path)
+            else:
+                self.set_destination_hash(destination_hash)
+                self.set_path(path)
+                self.set_request_data(request_data)
+                self.load_page()
+
+    def set_destination_hash(self, destination_hash):
+        if len(destination_hash) == RNS.Identity.TRUNCATED_HASHLENGTH//8:
+            self.destination_hash = destination_hash
+            return True
+        else:
+            return False
+
+
+    def set_path(self, path):
+        self.path = path
+
+    def set_request_data(self, request_data):
+        self.request_data = request_data
+
+    def set_timeout(self, timeout):
+        self.timeout = timeout
+
+    def path_timeout(self, destination_hash):
+        return max(self.timeout + self.app.rns.get_first_hop_timeout(destination_hash), self.app.rns.get_medium_path_timeout())
+
+    def download_local_file(self, path):
+        try:
+            file_path = self.app.filespath+path.replace("/file", "", 1)
+            if os.path.isfile(file_path):
+                file_name = os.path.basename(file_path)
+                file_destination = self.app.downloads_path+"/"+file_name
+
+                counter = 0
+                while os.path.isfile(file_destination):
+                    counter += 1
+                    file_destination = self.app.downloads_path+"/"+file_name+"."+str(counter)
+
+                fs = open(file_path, "rb")
+                fd = open(file_destination, "wb")
+                fd.write(fs.read())
+                fd.close()
+                fs.close()
+
+                self.saved_file_name = file_destination.replace(self.app.downloads_path+"/", "", 1)
+                try: self.saved_file_size = os.path.getsize(file_destination)
+                except: self.saved_file_size = 0
+                
+                self.update_display()
+            else:
+                RNS.log("The requested local download file does not exist: "+str(file_path), RNS.LOG_ERROR)
+
+            self.status = Browser.DONE
+            self.response_progress = 0
+            self.response_speed = None
+            self.progress_updated_at = None
+            self.previous_progress = 0
+            
+        except Exception as e:
+            RNS.log("An error occurred while handling file response. The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+    def download_file(self, destination_hash, path, data=None):
+        if self.link == None or self.link.destination.hash != self.destination_hash:
+            if not RNS.Transport.has_path(self.destination_hash):
+                self.status = Browser.NO_PATH
+                self.update_display()
+
+                RNS.Transport.request_path(self.destination_hash)
+                self.status = Browser.PATH_REQUESTED
+                self.update_display()
+
+                pr_time = time.time()+self.path_timeout(self.destination_hash)
+                while not RNS.Transport.has_path(self.destination_hash):
+                    if time.time() > pr_time:
+                        self.request_timeout()
+                        return
+
+                    time.sleep(0.25)
+
+            self.status = Browser.ESTABLISHING_LINK
+            self.update_display()
+
+            identity = RNS.Identity.recall(self.destination_hash)
+            destination = RNS.Destination(
+                identity,
+                RNS.Destination.OUT,
+                RNS.Destination.SINGLE,
+                self.app_name,
+                self.aspects
+            )
+
+            self.link = RNS.Link(destination, established_callback = self.link_established, closed_callback = self.link_closed)
+
+            while self.status == Browser.ESTABLISHING_LINK:
+                time.sleep(0.1)
+
+            if self.status != Browser.LINK_ESTABLISHED:
+                return
+
+            self.update_display()
+
+        if self.link != None and self.link.destination.hash == self.destination_hash:
+            # Send the request
+            self.status = Browser.REQUESTING
+            self.response_progress = 0
+            self.response_speed = None
+            self.progress_updated_at = None
+            self.previous_progress = 0
+            self.response_size = None
+            self.response_transfer_size = None
+            self.saved_file_name = None
+            self.saved_file_size = 0
+
+            self.update_display()
+            receipt = self.link.request(
+                path,
+                data = data,
+                response_callback = self.file_received,
+                failed_callback = self.request_failed,
+                progress_callback = self.response_progressed
+            )
+
+            if receipt:
+                self.last_request_receipt = receipt
+                self.last_request_id = receipt.request_id
+                self.status = Browser.REQUEST_SENT
+                self.update_display()
+            else:
+                self.link.teardown()
+
+    def write_history(self):
+        entry = [self.destination_hash, self.path, self.request_data]
+        self.history.insert(self.history_ptr, entry)
+        self.history_ptr += 1
+
+        if len(self.history) > self.history_ptr:
+            self.history = self.history[:self.history_ptr]
+
+    def back(self):
+        target_ptr = self.history_ptr-1
+        if not self.history_inc and not self.history_dec:
+            if target_ptr > 0:
+                self.history_dec = True
+                entry = self.history[target_ptr-1]
+                url = RNS.hexrep(entry[0], delimit=False)+":"+entry[1]
+                self.history_ptr = target_ptr
+                self.retrieve_url(url, request_data=entry[2])
+
+    def forward(self):
+        target_ptr = self.history_ptr+1
+        if not self.history_inc and not self.history_dec:
+            if target_ptr <= len(self.history):
+                self.history_dec = True
+                entry = self.history[target_ptr-1]
+                url = RNS.hexrep(entry[0], delimit=False)+":"+entry[1]
+                self.history_ptr = target_ptr
+                self.retrieve_url(url, request_data=entry[2])
+
+    def reload(self):
+        if not self.reloading and self.status == Browser.DONE:
+            self.reloading = True
+            self.uncache_page(self.current_url())
+            self.load_page()
+
+    def copy_url(self):
+        url = self.current_url()
+        if not url:
+            return
+
+        if not osc52_copy(url):
+            return
+
+        try:
+            notice = urwid.AttrMap(urwid.Pile([urwid.Divider(self.g["divider1"]), urwid.Text("Copied URL to clipboard")]), "browser_controls")
+            if self.page_background_color != None or self.page_foreground_color != None:
+                style_name = make_style(default_state(fg=self.page_foreground_color, bg=self.page_background_color))
+                notice.set_attr_map({None: style_name})
+            self.browser_footer = notice
+            self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+
+            def restore_footer(loop, user_data):
+                if self.status == Browser.DONE:
+                    self.browser_footer = self.make_status_widget()
+                else:
+                    self.browser_footer = urwid.Text("")
+                if self.frame is not None:
+                    self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+
+            self.app.ui.loop.set_alarm_in(2.0, restore_footer)
+        except Exception as e:
+            RNS.log("Could not update footer after URL copy: "+str(e), RNS.LOG_ERROR)
+
+    def close_dialogs(self):
+        options = self.delegate.columns.options(urwid.WEIGHT, self.delegate.right_area_width)
+        self.delegate.columns.contents[1] = (self.display_widget, options)
+
+    def url_dialog(self):
+        e_url = UrlEdit(caption="URL : ", edit_text=self.current_url())
+
+        def dismiss_dialog(sender):
+            self.close_dialogs()
+
+        def confirmed(sender):
+            try:
+                entered_url = e_url.get_edit_text().strip()
+                if not "`" in entered_url and ":" in entered_url:
+                    pos = entered_url.find("|")
+                    if pos > 0: entered_url = entered_url[:pos]+"`"+entered_url[pos+1:]
+                self.retrieve_url(entered_url)
+            except Exception as e:
+                self.browser_footer = urwid.Text("Could not open link: "+str(e))
+                self.frame.contents["footer"] = (self.browser_footer, self.frame.options())
+
+            self.close_dialogs()
+
+        dialog = UrlDialogLineBox(
+            urwid.Pile([
+                e_url,
+                urwid.Columns([
+                    (urwid.WEIGHT, 0.45, urwid.Button("Cancel", on_press=dismiss_dialog)),
+                    (urwid.WEIGHT, 0.1, urwid.Text("")),
+                    (urwid.WEIGHT, 0.45, urwid.Button("Go", on_press=confirmed)),
+                ])
+            ]), title="Enter URL"
+        )
+        e_url.confirmed = confirmed
+        dialog.confirmed = confirmed
+        dialog.delegate = self
+        bottom = self.display_widget
+
+        overlay = urwid.Overlay(
+            dialog,
+            bottom,
+            align=urwid.CENTER,
+            width=(urwid.RELATIVE, 65),
+            valign=urwid.MIDDLE,
+            height=urwid.PACK,
+            left=2,
+            right=2,
+        )
+
+        options = self.delegate.columns.options(urwid.WEIGHT, self.delegate.right_area_width)
+        self.delegate.columns.contents[1] = (overlay, options)
+        self.delegate.columns.focus_position = 1
+
+    def save_node_dialog(self):
+        if self.destination_hash != None:
+            try:
+                def dismiss_dialog(sender):
+                    self.close_dialogs()
+
+                display_name = RNS.Identity.recall_app_data(self.destination_hash)
+                disp_str = ""
+                if display_name != None:
+                    display_name = display_name.decode("utf-8")
+                    disp_str = " \""+display_name+"\""
+                    
+                def confirmed(sender):
+                    node_entry = DirectoryEntry(self.destination_hash, display_name=display_name, hosts_node=True)
+                    self.app.directory.remember(node_entry)
+                    self.app.ui.main_display.sub_displays.network_display.directory_change_callback()
+
+                    self.close_dialogs()
+
+                dialog = UrlDialogLineBox(
+                    urwid.Pile([
+                        urwid.Text("Save connected node"+disp_str+" "+RNS.prettyhexrep(self.destination_hash)+" to Known Nodes?\n"),
+                        urwid.Columns([
+                            (urwid.WEIGHT, 0.45, urwid.Button("Cancel", on_press=dismiss_dialog)),
+                            (urwid.WEIGHT, 0.1, urwid.Text("")),
+                            (urwid.WEIGHT, 0.45, urwid.Button("Save", on_press=confirmed)),
+                        ])
+                    ]), title="Save Node"
+                )
+
+                dialog.confirmed = confirmed
+                dialog.delegate = self
+                bottom = self.display_widget
+
+                overlay = urwid.Overlay(
+                    dialog,
+                    bottom,
+                    align=urwid.CENTER,
+                    width=(urwid.RELATIVE, 50),
+                    valign=urwid.MIDDLE,
+                    height=urwid.PACK,
+                    left=2,
+                    right=2,
+                )
+
+                options = self.delegate.columns.options(urwid.WEIGHT, self.delegate.right_area_width)
+                self.delegate.columns.contents[1] = (overlay, options)
+                self.delegate.columns.focus_position = 1
+
+            except Exception as e:
+                pass
+
+    def load_page(self):
+        if self.request_data == None:
+            cached = self.get_cached(self.current_url())
+        else:
+            cached = None
+
+        if cached:
+            self.status = Browser.DONE
+            self.page_data = cached
+            self.markup = self.page_data.decode("utf-8")
+            
+            self.page_background_color = None
+            bgpos = self.markup.find("#!bg=")
+            if bgpos >= 0:
+                endpos = self.markup.find("\n", bgpos)
+                if endpos-(bgpos+5) == 3:
+                    bg = self.markup[bgpos+5:endpos]
+                    self.page_background_color = bg
+                elif endpos-(bgpos+5) == 6:
+                    bg = self.markup[bgpos+5:endpos]
+                    self.page_background_color = bg
+
+            self.page_foreground_color = None
+            fgpos = self.markup.find("#!fg=")
+            if fgpos >= 0:
+                endpos = self.markup.find("\n", fgpos)
+                if endpos-(fgpos+5) == 3:
+                    fg = self.markup[fgpos+5:endpos]
+                    self.page_foreground_color = fg
+                elif endpos-(fgpos+5) == 6:
+                    fg = self.markup[fgpos+5:endpos]
+                    self.page_foreground_color = fg
+
+            try: self.attr_maps = markup_to_attrmaps(strip_modifiers(self.markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+            except Exception as e: self.attr_maps = [urwid.AttrMap(urwid.Text(f"Could not render page: {e}"), "browser_inactive")]
+            
+            self.response_progress = 0
+            self.response_speed = None
+            self.progress_updated_at = None
+            self.previous_progress = 0
+            self.response_size = None
+            self.response_transfer_size = None
+            self.saved_file_name = None
+            self.saved_file_size = 0
+            self.loaded_from_cache = True
+
+            self.update_display()
+
+            if not self.history_inc and not self.history_dec and not self.reloading:
+                self.write_history()
+            else:
+                self.history_dec = False
+                self.history_inc = False
+                self.reloading = False
+
+            if self.request_data and "var_anchor" in self.request_data:
+                def df(loop, user_data): self._jump_to_anchor(self.request_data["var_anchor"])
+                nomadnet.NomadNetworkApp.get_shared_instance().ui.loop.set_alarm_in(0.0, df)
+
+        else:
+            if self.destination_hash != self.loopback:
+                load_thread = threading.Thread(target=self.__load)
+                load_thread.setDaemon(True)
+                load_thread.start()
+            else:
+                RNS.log("Browser handling local page: "+str(self.path), RNS.LOG_DEBUG)
+                page_path = self.app.pagespath+self.path.replace("/page", "", 1)
+
+                page_data = b"The requested local page did not exist in the file system"
+                if os.path.isfile(page_path):
+                    if os.access(page_path, os.X_OK):
+                        if self.request_data != None:
+                            env_map = self.request_data
+                        else:
+                            env_map = {}
+                            
+                        if "PATH" in os.environ:
+                            env_map["PATH"] = os.environ["PATH"]
+
+                        generated = subprocess.run([page_path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env_map)
+                        page_data = generated.stdout
+                    else:
+                        file = open(page_path, "rb")
+                        page_data = file.read()
+                        file.close()
+
+                self.status = Browser.DONE
+                self.page_data = page_data
+                self.markup = self.page_data.decode("utf-8")
+                
+                self.page_background_color = None
+                bgpos = self.markup.find("#!bg=")
+                if bgpos >= 0:
+                    endpos = self.markup.find("\n", bgpos)
+                    if endpos-(bgpos+5) == 3:
+                        bg = self.markup[bgpos+5:endpos]
+                        self.page_background_color = bg
+                    elif endpos-(bgpos+5) == 6:
+                        bg = self.markup[bgpos+5:endpos]
+                        self.page_background_color = bg
+
+                self.page_foreground_color = None
+                fgpos = self.markup.find("#!fg=")
+                if fgpos >= 0:
+                    endpos = self.markup.find("\n", fgpos)
+                    if endpos-(fgpos+5) == 3:
+                        fg = self.markup[fgpos+5:endpos]
+                        self.page_foreground_color = fg
+                    elif endpos-(fgpos+5) == 6:
+                        fg = self.markup[fgpos+5:endpos]
+                        self.page_foreground_color = fg
+
+                try: self.attr_maps = markup_to_attrmaps(strip_modifiers(self.markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+                except Exception as e: self.attr_maps = [urwid.AttrMap(urwid.Text(f"Could not render page: {e}"), "browser_inactive")]
+                
+                self.response_progress = 0
+                self.response_speed = None
+                self.progress_updated_at = None
+                self.previous_progress = 0
+                self.response_size = None
+                self.response_transfer_size = None
+                self.saved_file_name = None
+                self.saved_file_size = 0
+                self.loaded_from_cache = False
+
+                self.update_display()
+
+                if not self.history_inc and not self.history_dec and not self.reloading:
+                    self.write_history()
+                else:
+                    self.history_dec = False
+                    self.history_inc = False
+                    self.reloading = False
+
+                if self.request_data and "var_anchor" in self.request_data:
+                    def df(loop, user_data): self._jump_to_anchor(self.request_data["var_anchor"])
+                    nomadnet.NomadNetworkApp.get_shared_instance().ui.loop.set_alarm_in(0.0, df)
+
+
+    def __load(self):
+        # If an established link exists, but it doesn't match the target
+        # destination, we close and clear it.
+        if self.link != None and (self.link.destination.hash != self.destination_hash or self.link.status != RNS.Link.ACTIVE):
+            self.link.teardown()
+            self.link = None
+
+        # If no link to the destination exists, we create one.
+        if self.link == None:
+            if not RNS.Transport.has_path(self.destination_hash):
+                self.status = Browser.NO_PATH
+                self.update_display()
+
+                RNS.Transport.request_path(self.destination_hash)
+                self.status = Browser.PATH_REQUESTED
+                self.update_display()
+
+                pr_time = time.time()+self.path_timeout(self.destination_hash)
+                while not RNS.Transport.has_path(self.destination_hash):
+                    if time.time() > pr_time:
+                        self.request_timeout()
+                        return
+
+                    time.sleep(0.25)
+
+            self.status = Browser.ESTABLISHING_LINK
+            self.update_display()
+
+            identity = RNS.Identity.recall(self.destination_hash)
+            destination = RNS.Destination(
+                identity,
+                RNS.Destination.OUT,
+                RNS.Destination.SINGLE,
+                self.app_name,
+                self.aspects
+            )
+
+            self.link = RNS.Link(destination, established_callback = self.link_established, closed_callback = self.link_closed)
+
+            while self.status == Browser.ESTABLISHING_LINK:
+                time.sleep(0.1)
+
+            if self.status != Browser.LINK_ESTABLISHED:
+                return
+
+            self.update_display()
+
+        # Send the request
+        self.status = Browser.REQUESTING
+        self.response_progress = 0
+        self.response_speed = None
+        self.progress_updated_at = None
+        self.previous_progress = 0
+        self.response_size = None
+        self.response_transfer_size = None
+        self.saved_file_name = None
+        self.saved_file_size = 0
+
+
+        self.update_display()
+        receipt = self.link.request(
+            self.path,
+            data = self.request_data,
+            response_callback = self.response_received,
+            failed_callback = self.request_failed,
+            progress_callback = self.response_progressed
+        )
+
+        if receipt:
+            self.last_request_receipt = receipt
+            self.last_request_id = receipt.request_id
+            self.status = Browser.REQUEST_SENT
+            self.update_display()
+        else:
+            self.link.teardown()
+
+
+
+    def link_established(self, link):
+        self.status = Browser.LINK_ESTABLISHED
+
+        if self.app.directory.should_identify_on_connect(self.destination_hash):
+            RNS.log("Link established, identifying to remote system...", RNS.LOG_VERBOSE)
+            self.link.identify(self.app.identity)
+
+
+    def link_closed(self, link):
+        if self.status == Browser.DISCONECTED or self.status == Browser.DONE:
+            self.link = None
+        elif self.status == Browser.ESTABLISHING_LINK:
+            self.link_establishment_timeout()
+        else:
+            self.link = None
+            self.status = Browser.REQUEST_FAILED
+        self.update_display()
+
+    def link_establishment_timeout(self):
+        self.status = Browser.LINK_TIMEOUT
+        self.response_progress = 0
+        self.response_speed = None
+        self.progress_updated_at = None
+        self.previous_progress = 0
+        self.response_size = None
+        self.response_transfer_size = None
+        self.link = None
+
+        self.update_display()
+
+
+    def response_received(self, request_receipt):
+        try:
+            self.status = Browser.DONE
+            self.page_data = request_receipt.response
+            self.markup = self.page_data.decode("utf-8")
+
+            self.page_background_color = None
+            bgpos = self.markup.find("#!bg=")
+            if bgpos >= 0:
+                endpos = self.markup.find("\n", bgpos)
+                if endpos-(bgpos+5) == 3:
+                    bg = self.markup[bgpos+5:endpos]
+                    self.page_background_color = bg
+                elif endpos-(bgpos+5) == 6:
+                    bg = self.markup[bgpos+5:endpos]
+                    self.page_background_color = bg
+
+            self.page_foreground_color = None
+            fgpos = self.markup.find("#!fg=")
+            if fgpos >= 0:
+                endpos = self.markup.find("\n", fgpos)
+                if endpos-(fgpos+5) == 3:
+                    fg = self.markup[fgpos+5:endpos]
+                    self.page_foreground_color = fg
+                elif endpos-(fgpos+5) == 6:
+                    fg = self.markup[fgpos+5:endpos]
+                    self.page_foreground_color = fg
+
+            try: self.attr_maps = markup_to_attrmaps(strip_modifiers(self.markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+            except Exception as e: self.attr_maps = [urwid.AttrMap(urwid.Text(f"Could not render page: {e}"), "browser_inactive")]
+
+            self.response_progress = 0
+            self.response_speed = None
+            self.progress_updated_at = None
+            self.previous_progress = 0
+            self.loaded_from_cache = False
+
+            # Simple header handling. Should be expanded when more
+            # header tags are added.
+            cache_time = Browser.DEFAULT_CACHE_TIME
+            if self.markup[:4] == "#!c=":
+                try:
+                    endpos = self.markup.find("\n")
+                    if endpos == -1:
+                        endpos = len(self.markup)
+                    cache_time = int(self.markup[4:endpos])
+                except Exception as e: RNS.log(f"Invalid page cache time header: {e}", RNS.LOG_DEBUG)
+
+            self.update_display()
+
+            if not self.history_inc and not self.history_dec and not self.reloading:
+                self.write_history()
+            else:
+                self.history_dec = False
+                self.history_inc = False
+                self.reloading = False
+
+            if cache_time == 0:
+                RNS.log("Received page "+str(self.current_url())+", not caching due to header.", RNS.LOG_DEBUG)
+            else:
+                RNS.log("Received page "+str(self.current_url())+", caching for %.3f hours." % (cache_time/60/60), RNS.LOG_DEBUG)    
+                self.cache_page(cache_time)
+
+            if self.request_data and "var_anchor" in self.request_data:
+                def df(loop, user_data): self._jump_to_anchor(self.request_data["var_anchor"])
+                nomadnet.NomadNetworkApp.get_shared_instance().ui.loop.set_alarm_in(0.0, df)
+
+        except Exception as e:
+            RNS.log("An error occurred while handling response. The contained exception was: "+str(e))
+
+    def uncache_page(self, url):
+        url_hash = self.url_hash(url)
+        files = os.listdir(self.app.cachepath)
+        for file in files:
+            if file.startswith(url_hash):
+                cachefile = self.app.cachepath+"/"+file
+                os.unlink(cachefile)
+                RNS.log("Removed "+str(cachefile)+" from cache.", RNS.LOG_DEBUG)
+
+    def get_cached(self, url):
+        url_hash = self.url_hash(url)
+        files = os.listdir(self.app.cachepath)
+        for file in files:
+            cachepath = self.app.cachepath+"/"+file
+            try:
+                components = file.split("_")
+                if len(components) == 2 and len(components[0]) == 64 and len(components[1]) > 0:
+                    expires = float(components[1])
+
+                    if time.time() > expires:
+                        RNS.log("Removing stale cache entry "+str(file), RNS.LOG_DEBUG)
+                        os.unlink(cachepath)
+                    else:
+                        if file.startswith(url_hash):
+                            RNS.log("Found "+str(file)+" in cache.", RNS.LOG_DEBUG)
+                            RNS.log("Returning cached page", RNS.LOG_DEBUG)
+                            file = open(cachepath, "rb")
+                            data = file.read()
+                            file.close()
+                            return data
+
+            except Exception as e:
+                RNS.log("Error while parsing cache entry "+str(cachepath)+", removing it.", RNS.LOG_ERROR)
+                RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
+                try:
+                    os.unlink(cachepath)
+                except Exception as e:
+                    RNS.log("Additionally, an exception occurred while unlinking the entry: "+str(e), RNS.LOG_ERROR)
+                    RNS.log("You will probably need to remove this entry manually by deleting the file: "+str(cachepath), RNS.LOG_ERROR)
+
+                
+        return None
+
+    def clean_cache(self):
+        files = os.listdir(self.app.cachepath)
+        for file in files:
+            cachepath = self.app.cachepath+"/"+file
+            try:
+                components = file.split("_")
+                if len(components) == 2 and len(components[0]) == 64 and len(components[1]) > 0:
+                    expires = float(components[1])
+
+                    if time.time() > expires:
+                        RNS.log("Removing stale cache entry "+str(file), RNS.LOG_DEBUG)
+                        os.unlink(cachepath)
+
+            except Exception as e:
+                pass
+
+
+    def cache_page(self, cache_time):
+        url_hash = self.url_hash(self.current_url())
+        if url_hash == None:
+            RNS.log("Could not cache page "+str(self.current_url()), RNS.LOG_ERROR)
+        else:
+            try:
+                self.uncache_page(self.current_url())
+                cache_expires = time.time()+cache_time
+                filename = url_hash+"_"+str(cache_expires)
+                cachefile = self.app.cachepath+"/"+filename
+                file = open(cachefile, "wb")
+                file.write(self.page_data)
+                file.close()
+                RNS.log("Cached page "+str(self.current_url())+" to "+str(cachefile), RNS.LOG_DEBUG)
+
+            except Exception as e:
+                RNS.log("Could not write cache file for page "+str(self.current_url()), RNS.LOG_ERROR)
+                RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+
+    def file_received(self, request_receipt):
+        try:
+            if isinstance(request_receipt.response, bytes):
+                markup = request_receipt.response.decode("utf-8")
+                self.attr_maps = markup_to_attrmaps(strip_modifiers(markup), url_delegate=self, fg_color=self.page_foreground_color, bg_color=self.page_background_color)
+
+            elif type(request_receipt.response) == io.BufferedReader:
+                if request_receipt.metadata != None:
+                    file_name   = ConversationMessage.safe_attachment_name(request_receipt.metadata["name"])
+                    file_handle = request_receipt.response
+                    file_destination = self.app.downloads_path+"/"+file_name
+
+                    counter = 0
+                    while os.path.isfile(file_destination):
+                        counter += 1
+                        file_destination = self.app.downloads_path+"/"+file_name+"."+str(counter)
+
+                    shutil.move(file_handle.name, file_destination)
+
+                    self.saved_file_name = file_destination.replace(self.app.downloads_path+"/", "", 1)
+                    try: self.saved_file_size = os.path.getsize(file_destination)
+                    except: self.saved_file_size = 0
+                    self.file_saved_at = time.time()
+
+            else:
+                file_name = request_receipt.response[0]
+                file_data = request_receipt.response[1]
+                file_destination_name = ConversationMessage.safe_attachment_name(file_name)
+                file_destination = self.app.downloads_path+"/"+file_destination_name
+
+                counter = 0
+                while os.path.isfile(file_destination):
+                    counter += 1
+                    file_destination = self.app.downloads_path+"/"+file_destination_name+"."+str(counter)
+
+                fh = open(file_destination, "wb")
+                fh.write(file_data)
+                fh.close()
+
+                self.saved_file_name = file_destination.replace(self.app.downloads_path+"/", "", 1)
+                try: self.saved_file_size = os.path.getsize(file_destination)
+                except: self.saved_file_size = 0
+                    
+            self.status = Browser.DONE
+            self.response_progress = 0
+            self.response_speed = None
+            self.progress_updated_at = None
+            self.previous_progress = 0
+
+            self.update_display()
+
+        except Exception as e:
+            RNS.log("An error occurred while handling file response. The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+    
+    def request_failed(self, request_receipt=None):
+        if request_receipt != None:
+            if request_receipt.request_id == self.last_request_id:
+                self.status = Browser.REQUEST_FAILED
+                self.response_progress = 0
+                self.response_speed = None
+                self.progress_updated_at = None
+                self.previous_progress = 0
+                self.response_size = None
+                self.response_transfer_size = None
+
+                self.update_display()
+                if self.link != None:
+                    try: self.link.teardown()
+                    except Exception as e: pass
+        else:
+            self.status = Browser.REQUEST_FAILED
+            self.response_progress = 0
+            self.response_speed = None
+            self.progress_updated_at = None
+            self.previous_progress = 0
+            self.response_size = None
+            self.response_transfer_size = None
+
+            self.update_display()
+            if self.link != None:
+                try:
+                    self.link.teardown()
+                except Exception as e:
+                    pass
+
+
+    def request_timeout(self, request_receipt=None):
+        self.status = Browser.REQUEST_TIMEOUT
+        self.response_progress = 0
+        self.response_speed = None
+        self.progress_updated_at = None
+        self.previous_progress = 0
+        self.response_size = None
+        self.response_transfer_size = None
+
+        self.update_display()
+        if self.link != None:
+            try:
+                self.link.teardown()
+            except Exception as e:
+                pass
+
+
+    def response_progressed(self, request_receipt):
+        self.response_progress      = request_receipt.progress
+        self.response_time          = request_receipt.get_response_time()
+        self.response_size          = request_receipt.response_size
+        self.response_transfer_size = request_receipt.response_transfer_size
+        
+        now = time.time()
+        if self.progress_updated_at == None: self.progress_updated_at = now
+        if now > self.progress_updated_at+0.5:
+            td = now - self.progress_updated_at
+            pd = self.response_progress - self.previous_progress
+            bd = pd*self.response_transfer_size
+            self.response_speed = (bd/td)*8
+            self.previous_progress = self.response_progress
+            self.progress_updated_at = now
+
+        self.update_display()
+
+    def last_response_speed(self):
+        if self.response_transfer_size and self.response_time:
+            return (self.response_transfer_size/max(self.response_time, 0.0001))*8
+        else: return None
+
+    def status_text(self):
+        if self.status == Browser.DONE and self.response_transfer_size != None:
+            if self.response_time != None: response_time_str = "{:.2f}".format(self.response_time)
+            else:                          response_time_str = "None"
+
+            if self.saved_file_name == None: resp_size = self.response_size
+            else:                            resp_size = self.saved_file_size
+
+            if resp_size: stats_string = "  "+self.g["page"]+size_str(resp_size)
+            else:         stats_string = "  "
+            if self.response_transfer_size:
+                stats_string += "   "+self.g["arrow_d"]+size_str(self.response_transfer_size)+" in "+response_time_str
+            if self.response_transfer_size and self.response_time:
+                stats_string += "s   "+self.g["speed"]+size_str(self.response_transfer_size/self.response_time, suffix="b")+"/s"
+
+        elif self.loaded_from_cache:
+            stats_string = " (cached)"
+        else:
+            stats_string = ""
+
+        if self.status == Browser.NO_PATH:
+            return "No path to destination known"
+        elif self.status == Browser.PATH_REQUESTED:
+            return "Path requested, waiting for path..."
+        elif self.status == Browser.ESTABLISHING_LINK:
+            return "Establishing link..."
+        elif self.status == Browser.LINK_TIMEOUT:
+            return "Link establishment timed out"
+        elif self.status == Browser.LINK_ESTABLISHED:
+            return "Link established"
+        elif self.status == Browser.REQUESTING:
+            return "Sending request..."
+        elif self.status == Browser.REQUEST_SENT:
+            return "Request sent, awaiting response..."
+        elif self.status == Browser.REQUEST_FAILED:
+            return "Request failed"
+        elif self.status == Browser.REQUEST_TIMEOUT:
+            return "Request timed out"
+        elif self.status == Browser.RECEIVING_RESPONSE:
+            return "Receiving response..."
+        elif self.status == Browser.DONE:
+            if self.saved_file_name == None: return "Done"+stats_string
+            else:                            return "Saved "+str(self.saved_file_name)+stats_string
+        elif self.status == Browser.DISCONECTED:
+            return "Disconnected"
+        else:
+            return "Browser Status Unknown"
+
+
+class ResponseProgressBar(urwid.ProgressBar):
+    def __init__(self, empty, full, current=None, done=None, satt=None, owner=None):
+        super().__init__(empty, full, current=current, done=done, satt=satt)
+        self.owner = owner
+
+    def get_text(self):
+        if self.owner.response_speed: speed_str = " "+RNS.prettyspeed(self.owner.response_speed)
+        else: speed_str = ""
+        return "Receiving response "+super().get_text().replace(" %", "%")+speed_str
+
+# A convenience function for printing a human-
+# readable file size
+def size_str(num, suffix='B'):
+    units = ['','K','M','G','T','P','E','Z']
+    last_unit = 'Y'
+
+    if suffix == 'b':
+        num *= 8
+        units = ['','K','M','G','T','P','E','Z']
+        last_unit = 'Y'
+
+    for unit in units:
+        if abs(num) < 1000.0:
+            if unit == "":
+                return "%.0f%s%s" % (num, unit, suffix)
+            else:
+                return "%.2f%s%s" % (num, unit, suffix)
+        num /= 1000.0
+
+    return "%.2f%s%s" % (num, last_unit, suffix)
+
+class UrlDialogLineBox(urwid.LineBox):
+    def keypress(self, size, key):
+        if key == "esc":
+            self.delegate.close_dialogs()
+        else:
+            return super(UrlDialogLineBox, self).keypress(size, key)
+
+class UrlEdit(ReadlineMixin, urwid.Edit):
+    def keypress(self, size, key):
+        if key == "enter":
+            self.confirmed(self)
+        else:
+            return super(UrlEdit, self).keypress(size, key)

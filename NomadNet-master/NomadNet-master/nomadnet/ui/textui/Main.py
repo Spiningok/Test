@@ -1,0 +1,346 @@
+import RNS
+
+from .Network import *
+from .Conversations import *
+from .Channels import *
+from .Directory import *
+from .Config import *
+from .Interfaces import *
+from .Transport import *
+from .Utilities import *
+from .Map import *
+from .Log import *
+from .Guide import *
+from .Editor import *
+import urwid
+
+class SubDisplays():
+    def __init__(self, app):
+        self.app = app
+        self.network_display = NetworkDisplay(self.app)
+        self.conversations_display = ConversationsDisplay(self.app)
+        self.channels_display = ChannelsDisplay(self.app)
+        self.directory_display = DirectoryDisplay(self.app)
+        self.config_display = ConfigDisplay(self.app)
+        self.interface_display = InterfaceDisplay(self.app)
+        self.utilities_display = UtilitiesDisplay(self.app) if self._utilities_enabled(app) else None
+        self.map_display = MapDisplay(self.app)
+        self.log_display = LogDisplay(self.app)
+        self.guide_display = GuideDisplay(self.app)
+        self.page_editor_display = PageEditorDisplay(self.app) if app.enable_node else None
+
+        if app.firstrun:
+            self.active_display = self.guide_display
+        else:
+            self.active_display = self.conversations_display
+
+    def _utilities_enabled(self, app):
+        try:
+            return app.config["utilities"].as_bool("enable_utilities")
+        except Exception:
+            return False
+
+    def active(self):
+        return self.active_display
+
+class MenuButton(urwid.Button):
+    button_left = urwid.Text('[')
+    button_right = urwid.Text(']')
+
+class MainFrame(urwid.Frame):
+    FOCUS_CHECK_TIMEOUT = 0.25
+
+    def __init__(self, body, header=None, footer=None, delegate=None):
+        self.delegate = delegate
+        self.current_focus = None
+        super().__init__(body, header, footer)
+
+    def keypress_focus_check(self, deferred=False):
+        current_focus = self.delegate.widget.get_focus_widgets()[-1]
+
+        if deferred:
+            if current_focus != self.current_focus:
+                self.focus_changed()
+        else:
+            def deferred_focus_check(loop, user_data):
+                self.keypress_focus_check(deferred=True)
+            self.delegate.app.ui.loop.set_alarm_in(MainFrame.FOCUS_CHECK_TIMEOUT, deferred_focus_check)
+
+        self.current_focus = current_focus
+
+    def focus_changed(self):
+        current_focus = self.delegate.widget.get_focus_widgets()[-1]
+        current_focus_path = self.delegate.widget.get_focus_path()
+        
+        if len(current_focus_path) > 1:
+            if current_focus_path[0] == "body":
+                self.delegate.update_active_shortcuts()
+
+        if self.delegate.sub_displays.active() == self.delegate.sub_displays.conversations_display:
+            # Needed to refresh indicativelistbox styles on mouse focus change
+            self.delegate.sub_displays.conversations_display.focus_change_event()
+
+    def mouse_event(self, size, event, button, col, row, focus):
+        current_focus = self.delegate.widget.get_focus_widgets()[-1]
+        if current_focus != self.current_focus:
+            self.focus_changed()
+
+        self.current_focus = current_focus
+        return super(MainFrame, self).mouse_event(size, event, button, col, row, focus)
+
+    def keypress(self, size, key):
+        self.keypress_focus_check()
+        
+        #if key == "ctrl q":
+        #    raise urwid.ExitMainLoop
+
+        return super(MainFrame, self).keypress(size, key)
+
+class QuitDialogLineBox(urwid.LineBox):
+    def __init__(self, *args, on_cancel=None, **kwargs):
+        self.on_cancel = on_cancel
+        super().__init__(*args, **kwargs)
+
+    def keypress(self, size, key):
+        if key == "esc":
+            if self.on_cancel is not None:
+                self.on_cancel()
+            return None
+        return super().keypress(size, key)
+
+class MainDisplay():
+    def __init__(self, ui, app):
+        self.ui = ui
+        self.app = app
+
+        self.menu_display = MenuDisplay(self.app, self)
+        self.sub_displays = SubDisplays(self.app)
+
+        self.frame = MainFrame(self.sub_displays.active().widget, header=self.menu_display.widget, footer=self.sub_displays.active().shortcuts().widget, delegate=self)
+        self.widget = self.frame
+
+    def show_network(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.network_display
+        self.update_active_sub_display()
+        self.sub_displays.network_display.start()
+
+    def show_conversations(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.conversations_display
+        self.update_active_sub_display()
+
+    def show_channels(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.channels_display
+        self.update_active_sub_display()
+        self.sub_displays.channels_display.start()
+
+    def show_directory(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.directory_display
+        self.update_active_sub_display()
+
+    def show_map(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.map_display
+        self.update_active_sub_display()
+
+    def show_config(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.config_display
+        self.update_active_sub_display()
+
+    def show_interfaces(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.interface_display
+        self.update_active_sub_display()
+        self.sub_displays.interface_display.start()
+
+    def show_utilities(self, user_data):
+        if self.sub_displays.utilities_display is None:
+            return
+        self.sub_displays.active_display = self.sub_displays.utilities_display
+        self.update_active_sub_display()
+        self.sub_displays.utilities_display.start()
+
+    def show_log(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.log_display
+        self.sub_displays.log_display.show()
+        self.update_active_sub_display()
+
+    def show_guide(self, user_data):
+        self.sub_displays.active_display = self.sub_displays.guide_display
+        self.update_active_sub_display()
+
+    def show_page_editor(self, user_data):
+        if not self.app.enable_node:
+            return
+        self.sub_displays.active_display = self.sub_displays.page_editor_display
+        self.update_active_sub_display()
+        self.sub_displays.page_editor_display.start()
+        self.frame.focus_position = "body"
+
+    def update_active_sub_display(self):
+        self.frame.contents["body"] = (self.sub_displays.active().widget, None)
+        self.update_active_shortcuts()
+        if self.sub_displays.active_display != self.sub_displays.log_display:
+            self.sub_displays.log_display.kill()
+
+    def update_active_shortcuts(self):
+        self.frame.contents["footer"] = (self.sub_displays.active().shortcuts().widget, None)
+
+    def request_redraw(self, extra_delay=0.0):
+        self.app.ui.loop.set_alarm_in(0.25+extra_delay, self.redraw_now)
+    
+    def redraw_now(self, sender=None, data=None):
+        self.app.ui.loop.screen.clear()
+        #self.app.ui.loop.draw_screen()
+
+    def start(self):
+        self.menu_display.start()
+
+    def quit(self, sender=None):
+        if self.app.peer_settings["quit_confirm"]: self.show_quit_dialog()
+        else: self.do_quit()
+
+    def show_quit_dialog(self, sender=None):
+        if getattr(self, "_quit_dialog_open", False): return
+
+        active = self.sub_displays.active_display
+        if active is self.sub_displays.log_display:
+            self.do_quit()
+            return
+        if active is self.sub_displays.config_display and self.sub_displays.config_display.editor_term is not None:
+            self.do_quit()
+            return
+
+        dont_ask_again = urwid.CheckBox("Don't ask again")
+
+        def confirm(button=None):
+            if dont_ask_again.get_state():
+                try:
+                    self.app.peer_settings["quit_confirm"] = False
+                    self.app.save_peer_settings()
+                except Exception: pass
+            self.do_quit()
+
+        def cancel(button=None):
+            self._quit_dialog_open = False
+            self.app.ui.loop.widget = self.frame
+
+        buttons = urwid.Columns([
+            (urwid.WEIGHT, 0.45, urwid.Button("Yes", on_press=confirm)),
+            (urwid.WEIGHT, 0.1, urwid.Text("")),
+            (urwid.WEIGHT, 0.45, urwid.Button("No", on_press=cancel)),
+        ])
+        try: buttons.focus_position = 2  # default to "No"
+        except Exception: pass
+
+        pile = urwid.Pile([
+            urwid.Text("Are you sure you want to quit?", align="center"),
+            urwid.Divider(),
+            buttons,
+            urwid.Divider(),
+            dont_ask_again,
+        ])
+
+        dialog = QuitDialogLineBox(
+            urwid.Filler(pile, urwid.TOP),
+            title="Quit NomadNet",
+            on_cancel=cancel,
+        )
+
+        self._quit_dialog_open = True
+
+        self.app.ui.loop.widget = urwid.Overlay(
+            dialog, self.frame,
+            align="center", width=44,
+            valign="middle", height=7, min_width=20,
+        )
+
+    def show_notice(self, text):
+        def close(button=None): self.app.ui.loop.widget = self.frame
+        pile = urwid.Pile([urwid.Text(text, align="center"), urwid.Divider(), urwid.Button("OK", on_press=close)])
+        dialog = QuitDialogLineBox(urwid.Filler(pile, urwid.TOP), title="Notice", on_cancel=close)
+        self.app.ui.loop.widget = urwid.Overlay(dialog, self.frame, align="center", width=64, valign="middle", height=9, min_width=20)
+
+    def do_quit(self, sender=None):
+        logterm_pid = None
+        if True or RNS.vendor.platformutils.is_android():
+            if self.sub_displays.log_display != None and self.sub_displays.log_display.log_term != None:
+                if self.sub_displays.log_display.log_term.log_term != None:
+                    logterm_pid = self.sub_displays.log_display.log_term.log_term.pid
+                    if logterm_pid != None:
+                        import os, signal
+                        os.kill(logterm_pid, signal.SIGKILL)
+
+        raise urwid.ExitMainLoop
+
+
+class MenuColumns(urwid.Columns):
+    def keypress(self, size, key):
+        if key == "tab" or key == "down":
+            self.handler.frame.focus_position = "body"
+
+        return super(MenuColumns, self).keypress(size, key)
+
+class MenuDisplay():
+    UPDATE_INTERVAL = 2
+
+    def __init__(self, app, handler):
+        self.app = app
+        self.update_interval = MenuDisplay.UPDATE_INTERVAL
+        self.g = self.app.ui.glyphs
+
+        self.menu_indicator  = urwid.Text("")
+
+        menu_text             = (urwid.PACK, self.menu_indicator)
+        button_network        = (11, MenuButton("Network", on_press=handler.show_network))
+        button_conversations  = (17, MenuButton("Conversations", on_press=handler.show_conversations))
+        button_channels       = (12, MenuButton("Channels", on_press=handler.show_channels))
+        button_directory      = (13, MenuButton("Directory", on_press=handler.show_directory))
+        button_map            = (7,  MenuButton("Map", on_press=handler.show_map))
+        button_log            = (7,  MenuButton("Log", on_press=handler.show_log))
+        button_config         = (10, MenuButton("Config", on_press=handler.show_config))
+        button_interfaces     = (14, MenuButton("Interfaces", on_press=handler.show_interfaces))
+        button_utilities      = (13, MenuButton("Utilities", on_press=handler.show_utilities))
+        button_guide          = (9,  MenuButton("Guide", on_press=handler.show_guide))
+        button_mynode         = (11, MenuButton("My Node", on_press=handler.show_page_editor))
+        button_quit           = (8,  MenuButton("Quit", on_press=handler.quit))
+
+        # buttons = [menu_text, button_conversations, button_node, button_directory, button_map]
+        buttons = [menu_text, button_conversations, button_network]
+        if self.app.enable_node:
+            buttons.append(button_mynode)
+        buttons += [button_channels, button_log, button_interfaces]
+        enable_utilities = False
+        try:
+            enable_utilities = self.app.config["utilities"].as_bool("enable_utilities")
+        except Exception:
+            enable_utilities = False
+        if enable_utilities:
+            buttons.append(button_utilities)
+        buttons.append(button_config)
+        if not self.app.config["textui"]["hide_guide"]:
+            buttons.append(button_guide)
+        buttons.append(button_quit)
+
+        columns = MenuColumns(buttons, dividechars=1)
+        columns.handler = handler
+
+        self.update_display()
+
+        self.widget = urwid.AttrMap(columns, "menubar")
+
+    def start(self):
+        self.update_display_job()
+
+    def update_display_job(self, event = None, sender = None):
+        self.update_display()
+        self.app.ui.loop.set_alarm_in(self.update_interval, self.update_display_job)
+
+    def update_display(self):
+        if self.app.has_unread_conversations():
+            self.indicate_unread()
+        else:
+            self.indicate_normal()
+
+    def indicate_normal(self):
+        self.menu_indicator.set_text(self.g["decoration_menu"])
+
+    def indicate_unread(self):
+        self.menu_indicator.set_text(self.g["unread_menu"])
